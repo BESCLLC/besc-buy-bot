@@ -19,7 +19,7 @@ const {
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-const redis = new Redis(REDIS_URL);
+const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
 
 // Health HTTP server so Railway keeps us alive
 const app = express();
@@ -33,24 +33,35 @@ const CG_BASE = 'https://pro-api.coingecko.com/api/v3/onchain'; // paid upgrade
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// store chat config in Redis per chat
 async function getChat(chatId) {
+  if (!redis) return memoryStore.get(chatId) || defaultChatConfig();
   const raw = await redis.get(`chat:${chatId}:config`);
   if (raw) return JSON.parse(raw);
-  const cfg = {
-    pools: [],                // array of pool addresses (0x..)
-    minBuyUsd: 0,
-    gifUrl: null,
-    emoji: { small: '🟢', mid: '💎', large: '🐋' },
-    tiers: { small: 100, large: 1000 }, // <100 small, <1000 mid, >=1000 large
-    tokenSymbols: {}          // pool->symbol
-  };
+  const cfg = defaultChatConfig();
   await redis.set(`chat:${chatId}:config`, JSON.stringify(cfg));
   return cfg;
 }
+
 async function setChat(chatId, cfg) {
+  if (!redis) {
+    memoryStore.set(chatId, cfg);
+    return;
+  }
   await redis.set(`chat:${chatId}:config`, JSON.stringify(cfg));
 }
+
+function defaultChatConfig() {
+  return {
+    pools: [],
+    minBuyUsd: 0,
+    gifUrl: null,
+    emoji: { small: '🟢', mid: '💎', large: '🐋' },
+    tiers: { small: 100, large: 1000 },
+    tokenSymbols: {}
+  };
+}
+
+const memoryStore = new Map();
 
 function tierEmoji(cfg, usd) {
   if (usd >= cfg.tiers.large) return cfg.emoji.large;
@@ -64,59 +75,56 @@ function escapeHtml(s) {
 
 // ---------- GeckoTerminal + CoinGecko wrappers ----------
 async function fetchTopPoolForToken(tokenAddr) {
-  // GET /networks/{network}/tokens/{token}
-  // Parse relationships.top_pools to pick first pool id → "..._{0xPool}"
-  // Public, keyless. Docs: apiguide + Swagger. 
   const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
-  const { data } = await axios.get(url);
+  const { data } = await axios.get(url, {
+    headers: { 'Accept': 'application/json;version=20230302' }
+  });
   const pools = data?.data?.relationships?.top_pools?.data || [];
   if (!pools.length) return null;
-  const poolId = pools[0].id;               // e.g., "besc-hyperchain_0xABC..."
+  const poolId = pools[0].id;
   const pool = poolId.split('_').pop();
-  // Try symbol
   const symbol = data?.data?.attributes?.symbol || 'TOKEN';
   return { pool, symbol };
 }
 
 async function fetchTradesForPool(pool) {
-  // Prefer CoinGecko /onchain trades (paid), else GeckoTerminal swaps (free)
-  if (USE_COINGECKO_ONCHAIN === 'true' && COINGECKO_API_KEY) {
-    const url = `${CG_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
-    const { data } = await axios.get(url, {
-      headers: { 'x-cg-pro-api-key': COINGECKO_API_KEY }
-    });
-    // Standardize items
-    const items = (data?.data || []).map(x => {
-      const a = x.attributes || {};
-      return {
-        tx: a.tx_hash,
-        priceUsd: Number(a.price_usd),
-        amountUsd: Number(a.amount_usd),
-        amountToken: Number(a.amount_token),
-        tradeType: (a.trade_type || '').toLowerCase(), // "buy" | "sell"
-        buyer: a.trader_address || null,
-        ts: a.block_timestamp
-      };
-    });
-    return items;
-  } else {
-    // Free public: /pools/{pool}/trades?limit=5 (fields vary, but include tx hash & usd)
-    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/swaps?limit=5`;
-    const { data } = await axios.get(url);
-    const items = (data?.data || []).map(x => {
-      const a = x.attributes || {};
-      return {
-        tx: a.tx_hash,
-        priceUsd: Number(a.price_usd ?? a.token_price_usd ?? a.price_usd_buy ?? a.price), // tolerant
-        amountUsd: Number(a.amount_usd ?? a.volume_usd ?? 0),
-        amountToken: Number(a.amount_token ?? a.amount_out ?? a.amount_in ?? 0),
-        tradeType: (a.trade_type || a.direction || '').toLowerCase(), // may be empty
-        buyer: a.trader_address || null,
-        ts: a.block_timestamp || a.timestamp
-      };
-    });
-    return items;
+  try {
+    if (USE_COINGECKO_ONCHAIN === 'true' && COINGECKO_API_KEY) {
+      const url = `${CG_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
+      const { data } = await axios.get(url, {
+        headers: {
+          'x-cg-pro-api-key': COINGECKO_API_KEY,
+          'Accept': 'application/json;version=20230302'
+        }
+      });
+      return normalizeTrades(data?.data);
+    } else {
+      const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
+      const { data } = await axios.get(url, {
+        headers: { 'Accept': 'application/json;version=20230302' }
+      });
+      return normalizeTrades(data?.data);
+    }
+  } catch (e) {
+    console.error(`[GeckoTerminal] Failed for pool ${pool}:`, e.response?.status, e.response?.data || e.message);
+    return [];
   }
+}
+
+function normalizeTrades(items) {
+  return (items || []).map(x => {
+    const a = x.attributes || {};
+    return {
+      id: x.id, // unique trade id
+      tx: a.tx_hash,
+      priceUsd: Number(a.price_usd ?? 0),
+      amountUsd: Number(a.amount_usd ?? 0),
+      amountToken: Number(a.amount_token ?? 0),
+      tradeType: (a.trade_type || '').toLowerCase(),
+      buyer: a.trader_address || null,
+      ts: a.block_timestamp || a.timestamp
+    };
+  });
 }
 
 // ---------- Telegram commands ----------
@@ -134,9 +142,7 @@ bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
     const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${top.pool}`;
     bot.sendMessage(chatId, `✅ Tracking <b>${escapeHtml(top.symbol)}</b>\nPool: <code>${top.pool}</code>`, {
       parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [[{ text: '📈 Chart', url: chart }]]
-      }
+      reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }]] }
     });
   } catch (e) {
     console.error(e);
@@ -155,7 +161,7 @@ bot.onText(/\/remove (0x[a-fA-F0-9]{40})/, async (msg, match) => {
     delete cfg.tokenSymbols[top.pool];
     await setChat(chatId, cfg);
     bot.sendMessage(chatId, `🛑 Stopped tracking pool ${top.pool}`);
-  } catch (e) {
+  } catch {
     bot.sendMessage(chatId, '⚠️ Error removing.');
   }
 });
@@ -195,51 +201,47 @@ bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`);
 });
 
-// ---------- Poller (rotates pools to respect free rate limits) ----------
-const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 }); // 1 request / interval
-let poolRoundRobin = []; // unique pools tracked by ANY chat
+// ---------- Poller ----------
+const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
+let poolRoundRobin = [];
 
 async function refreshPoolSet() {
-  // union of pools from all chats (Redis scan)
-  const keys = await redis.keys('chat:*:config');
+  const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
   const set = new Set();
   for (const k of keys) {
-    const cfg = JSON.parse(await redis.get(k));
-    (cfg.pools || []).forEach(p => set.add(p));
+    const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(Number(k.split(':')[1]));
+    (cfg?.pools || []).forEach(p => set.add(p));
   }
   poolRoundRobin = Array.from(set);
 }
-setInterval(refreshPoolSet, 10000); // refresh every 10s at runtime
+setInterval(refreshPoolSet, 10000);
 refreshPoolSet();
 
-// per-pool last TX to avoid duplicates
-async function seen(pool, tx) {
-  const key = `pool:${pool}:lastTx`;
-  const last = await redis.get(key);
-  if (last === tx) return true;
-  await redis.set(key, tx);
+async function seen(pool, tradeId) {
+  if (!tradeId) return false;
+  const key = `pool:${pool}:lastTradeId`;
+  const last = redis ? await redis.get(key) : memoryStore.get(key);
+  if (last === tradeId) return true;
+  if (redis) await redis.set(key, tradeId);
+  else memoryStore.set(key, tradeId);
   return false;
 }
 
 async function broadcastTrade(pool, trade) {
-  // find all chats tracking this pool
-  const keys = await redis.keys('chat:*:config');
+  const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
   for (const k of keys) {
     const chatId = Number(k.split(':')[1]);
-    const cfg = JSON.parse(await redis.get(k));
+    const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
     if (!cfg.pools.includes(pool)) continue;
 
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
-
-    // Only BUY (if tradeType provided; otherwise assume "buy" if amountToken>0 as a heuristic)
-    const ttype = (trade.tradeType || '').toLowerCase();
-    if (ttype && ttype !== 'buy') continue;
+    if (trade.tradeType && trade.tradeType !== 'buy') continue;
 
     const emoji = tierEmoji(cfg, usd);
     const symbol = cfg.tokenSymbols[pool] || 'TOKEN';
     const price = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
-    const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, {maximumFractionDigits: 6}) : '—';
+    const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
     const txUrl = EXPLORER_TX_URL + trade.tx;
     const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${pool}`;
 
@@ -270,17 +272,14 @@ async function broadcastTrade(pool, trade) {
 
 async function tickOnce() {
   if (!poolRoundRobin.length) return;
-  // Take next pool in rotation
   const pool = poolRoundRobin.shift();
   poolRoundRobin.push(pool);
   const trades = await fetchTradesForPool(pool);
-  if (!trades || !trades.length) return;
-  // newest first
+  if (!trades.length) return;
   const latest = trades[0];
-  if (latest?.tx && await seen(pool, latest.tx)) return;
-  if (latest?.tx) await broadcastTrade(pool, latest);
+  if (latest?.id && await seen(pool, latest.id)) return;
+  if (latest?.id) await broadcastTrade(pool, latest);
 }
 
-// schedule: 1 request per POLL_INTERVAL_MS (default 2s) → 30 req/min on free plan
 setInterval(() => queue.add(tickOnce).catch(console.error), Number(POLL_INTERVAL_MS));
 console.log('Buy bot started on network:', GECKO_NETWORK);
