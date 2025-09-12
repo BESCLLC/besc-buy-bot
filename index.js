@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express from 'express';
 import TelegramBot from 'node-telegram-bot-api';
@@ -80,46 +81,39 @@ async function fetchTopPoolForToken(tokenAddr) {
 
 async function fetchTradesForPool(pool) {
   try {
-    if (USE_COINGECKO_ONCHAIN === 'true' && COINGECKO_API_KEY) {
-      const url = `${CG_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
-      const { data } = await axios.get(url, {
-        headers: {
-          'x-cg-pro-api-key': COINGECKO_API_KEY,
-          'Accept': 'application/json;version=20230302'
-        }
-      });
-      return normalizeTrades(data?.data);
-    } else {
-      const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
-      const { data } = await axios.get(url, {
-        headers: { 'Accept': 'application/json;version=20230302' }
-      });
-      return normalizeTrades(data?.data);
-    }
+    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
+    const { data } = await axios.get(url, {
+      headers: { 'Accept': 'application/json;version=20230302' }
+    });
+    return normalizeTrades(data?.data);
   } catch (e) {
     console.error(`[GeckoTerminal] Failed for pool ${pool}:`, e.response?.status, e.response?.data || e.message);
     return [];
   }
 }
 
+// ✅ Correct schema mapping
 function normalizeTrades(items) {
   return (items || []).map(x => {
     const a = x.attributes || {};
+    const kind = (a.kind || '').toLowerCase();
+    const isSell = kind === 'sell';
+    const tokenAmount = Number(isSell ? a.from_token_amount : a.to_token_amount);
     return {
       id: x.id,
       tx: a.tx_hash,
-      priceUsd: Number(a.price_usd ?? 0),
-      amountUsd: Number(a.amount_usd ?? 0),
-      amountToken: Number(a.amount_token ?? 0),
-      tradeType: (a.trade_type || '').toLowerCase(),
-      direction: a.direction || null,
-      buyer: a.trader_address || null,
-      ts: a.block_timestamp || a.timestamp,
-      needsPrice: (!a.price_usd || !a.amount_usd)
+      priceUsd: Number(a.price_to_in_usd ?? a.price_from_in_usd ?? 0),
+      amountUsd: Number(a.volume_in_usd ?? 0),
+      amountToken: tokenAmount,
+      tradeType: kind, // buy | sell
+      buyer: a.tx_from_address || null,
+      ts: a.block_timestamp,
+      needsPrice: false
     };
   });
 }
 
+// ---------- Telegram Commands ----------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
   const token = match[1];
@@ -228,7 +222,7 @@ async function broadcastTrade(pool, trade) {
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
 
-    const isSell = trade.tradeType === 'sell' || trade.direction === 'out';
+    const isSell = trade.tradeType === 'sell';
     const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
     const action = isSell ? 'SELL' : 'BUY';
 
@@ -268,43 +262,8 @@ async function tickOnce() {
   const pool = poolRoundRobin.shift();
   poolRoundRobin.push(pool);
 
-  let trades = await fetchTradesForPool(pool);
+  const trades = await fetchTradesForPool(pool);
   if (!trades.length) return;
-
-  if (trades[0].needsPrice) {
-    try {
-      const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
-      const poolRes = await axios.get(poolUrl, {
-        headers: { 'Accept': 'application/json;version=20230302' }
-      });
-      const attr = poolRes?.data?.data?.attributes || {};
-      let price = Number(attr.price_in_usd ?? 0);
-
-      if (!price || price === 0) {
-        const basePriceQuote = Number(attr.base_token_price_in_quote_token ?? 0);
-        const quotePriceUsd = Number(attr.quote_token_price_in_usd ?? 0);
-        if (quotePriceUsd > 0 && basePriceQuote > 0) {
-          price = basePriceQuote * quotePriceUsd;
-          console.log(`[DEBUG] Derived USD price from quote: $${price}`);
-        } else if (basePriceQuote > 0) {
-          price = basePriceQuote;
-          console.log(`[DEBUG] Using relative price: ${price}`);
-        } else {
-          console.warn(`[DEBUG] No price data available for pool ${pool}`);
-        }
-      }
-
-      if (price > 0) {
-        trades = trades.map(t => ({
-          ...t,
-          priceUsd: price,
-          amountUsd: price * t.amountToken
-        }));
-      }
-    } catch (e) {
-      console.warn(`[DEBUG] Could not fetch price for pool ${pool}`, e.message);
-    }
-  }
 
   console.log(`[DEBUG] Pool ${pool} returned ${trades.length} trades, latest USD: $${trades[0].amountUsd}`);
 
