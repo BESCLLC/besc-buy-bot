@@ -10,9 +10,9 @@ const {
   TELEGRAM_TOKEN,
   GECKO_NETWORK = 'besc-hyperchain',
   EXPLORER_TX_URL = 'https://explorer.beschyperchain.com/tx/',
-  REDIS_URL, // set by Railway Redis addon
-  POLL_INTERVAL_MS = '2000', // 2s per request (<=30/min)
-  USE_COINGECKO_ONCHAIN = 'false', // set "true" with COINGECKO_API_KEY to upgrade
+  REDIS_URL,
+  POLL_INTERVAL_MS = '2000',
+  USE_COINGECKO_ONCHAIN = 'false',
   COINGECKO_API_KEY
 } = process.env;
 
@@ -21,17 +21,27 @@ if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
 
-// Health HTTP server so Railway keeps us alive
+// Health HTTP server so Railway keeps service alive
 const app = express();
 app.get('/healthz', (_, res) => res.send('ok'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Health server on :' + PORT));
 
-// ---------- Helpers ----------
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
-const CG_BASE = 'https://pro-api.coingecko.com/api/v3/onchain'; // paid upgrade
+const CG_BASE = 'https://pro-api.coingecko.com/api/v3/onchain';
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const memoryStore = new Map();
+
+function defaultChatConfig() {
+  return {
+    pools: [],
+    minBuyUsd: 0,
+    gifUrl: null,
+    emoji: { small: '🟢', mid: '💎', large: '🐋' },
+    tiers: { small: 100, large: 1000 },
+    tokenSymbols: {}
+  };
+}
 
 async function getChat(chatId) {
   if (!redis) return memoryStore.get(chatId) || defaultChatConfig();
@@ -50,19 +60,6 @@ async function setChat(chatId, cfg) {
   await redis.set(`chat:${chatId}:config`, JSON.stringify(cfg));
 }
 
-function defaultChatConfig() {
-  return {
-    pools: [],
-    minBuyUsd: 0,
-    gifUrl: null,
-    emoji: { small: '🟢', mid: '💎', large: '🐋' },
-    tiers: { small: 100, large: 1000 },
-    tokenSymbols: {}
-  };
-}
-
-const memoryStore = new Map();
-
 function tierEmoji(cfg, usd) {
   if (usd >= cfg.tiers.large) return cfg.emoji.large;
   if (usd >= cfg.tiers.small) return cfg.emoji.mid;
@@ -73,7 +70,7 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ---------- GeckoTerminal + CoinGecko wrappers ----------
+// ---------- API Wrappers ----------
 async function fetchTopPoolForToken(tokenAddr) {
   const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
   const { data } = await axios.get(url, {
@@ -115,19 +112,20 @@ function normalizeTrades(items) {
   return (items || []).map(x => {
     const a = x.attributes || {};
     return {
-      id: x.id, // unique trade id
+      id: x.id,
       tx: a.tx_hash,
       priceUsd: Number(a.price_usd ?? 0),
       amountUsd: Number(a.amount_usd ?? 0),
       amountToken: Number(a.amount_token ?? 0),
       tradeType: (a.trade_type || '').toLowerCase(),
+      direction: a.direction || null,
       buyer: a.trader_address || null,
       ts: a.block_timestamp || a.timestamp
     };
   });
 }
 
-// ---------- Telegram commands ----------
+// ---------- Telegram Commands ----------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
   const token = match[1];
@@ -236,16 +234,19 @@ async function broadcastTrade(pool, trade) {
 
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
-    if (trade.tradeType && trade.tradeType !== 'buy') continue;
 
-    const emoji = tierEmoji(cfg, usd);
+    // 🔵 Detect buy/sell direction
+    const isSell = trade.tradeType === 'sell' || trade.direction === 'out';
+    const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
+    const action = isSell ? 'SELL' : 'BUY';
+
     const symbol = cfg.tokenSymbols[pool] || 'TOKEN';
     const price = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
     const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
     const txUrl = EXPLORER_TX_URL + trade.tx;
     const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${pool}`;
 
-    const caption = `${emoji} <b>BUY</b> • <b>${escapeHtml(symbol)}</b>\n` +
+    const caption = `${emoji} <b>${action}</b> • <b>${escapeHtml(symbol)}</b>\n` +
       `💵 <b>$${usd.toFixed(2)}</b>\n` +
       `🧮 ${amountTok} ${escapeHtml(symbol)} @ ${price}\n` +
       (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
@@ -274,9 +275,14 @@ async function tickOnce() {
   if (!poolRoundRobin.length) return;
   const pool = poolRoundRobin.shift();
   poolRoundRobin.push(pool);
+
   const trades = await fetchTradesForPool(pool);
+  console.log(`[DEBUG] Pool ${pool} returned ${trades.length} trades`);
   if (!trades.length) return;
+
   const latest = trades[0];
+  console.log(`[DEBUG] Latest trade:`, latest);
+
   if (latest?.id && await seen(pool, latest.id)) return;
   if (latest?.id) await broadcastTrade(pool, latest);
 }
