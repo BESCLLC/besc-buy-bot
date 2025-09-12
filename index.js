@@ -21,7 +21,7 @@ if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
 
-// Health HTTP server so Railway keeps service alive
+// Health HTTP server so Railway keeps us alive
 const app = express();
 app.get('/healthz', (_, res) => res.send('ok'));
 const PORT = process.env.PORT || 3000;
@@ -53,11 +53,8 @@ async function getChat(chatId) {
 }
 
 async function setChat(chatId, cfg) {
-  if (!redis) {
-    memoryStore.set(chatId, cfg);
-    return;
-  }
-  await redis.set(`chat:${chatId}:config`, JSON.stringify(cfg));
+  if (!redis) memoryStore.set(chatId, cfg);
+  else await redis.set(`chat:${chatId}:config`, JSON.stringify(cfg));
 }
 
 function tierEmoji(cfg, usd) {
@@ -111,16 +108,19 @@ async function fetchTradesForPool(pool) {
 function normalizeTrades(items) {
   return (items || []).map(x => {
     const a = x.attributes || {};
+    const priceUsd = Number(a.price_usd ?? 0);
+    const amountUsd = Number(a.amount_usd ?? 0);
     return {
       id: x.id,
       tx: a.tx_hash,
-      priceUsd: Number(a.price_usd ?? 0),
-      amountUsd: Number(a.amount_usd ?? 0),
+      priceUsd,
+      amountUsd,
       amountToken: Number(a.amount_token ?? 0),
       tradeType: (a.trade_type || '').toLowerCase(),
       direction: a.direction || null,
       buyer: a.trader_address || null,
-      ts: a.block_timestamp || a.timestamp
+      ts: a.block_timestamp || a.timestamp,
+      needsPrice: (!priceUsd || !amountUsd)
     };
   });
 }
@@ -235,7 +235,6 @@ async function broadcastTrade(pool, trade) {
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
 
-    // 🔵 Detect buy/sell direction
     const isSell = trade.tradeType === 'sell' || trade.direction === 'out';
     const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
     const action = isSell ? 'SELL' : 'BUY';
@@ -276,13 +275,32 @@ async function tickOnce() {
   const pool = poolRoundRobin.shift();
   poolRoundRobin.push(pool);
 
-  const trades = await fetchTradesForPool(pool);
-  console.log(`[DEBUG] Pool ${pool} returned ${trades.length} trades`);
+  let trades = await fetchTradesForPool(pool);
   if (!trades.length) return;
 
-  const latest = trades[0];
-  console.log(`[DEBUG] Latest trade:`, latest);
+  // Fallback price fetch if trades lack USD values
+  if (trades[0].needsPrice) {
+    try {
+      const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
+      const { data } = await axios.get(poolUrl, {
+        headers: { 'Accept': 'application/json;version=20230302' }
+      });
+      const price = Number(data?.data?.attributes?.price_in_usd ?? 0);
+      if (price > 0) {
+        trades = trades.map(t => ({
+          ...t,
+          priceUsd: price,
+          amountUsd: price * t.amountToken
+        }));
+      }
+    } catch (e) {
+      console.warn(`[DEBUG] Could not fetch price for pool ${pool}`, e.message);
+    }
+  }
 
+  console.log(`[DEBUG] Pool ${pool} returned ${trades.length} trades, latest USD: $${trades[0].amountUsd}`);
+
+  const latest = trades[0];
   if (latest?.id && await seen(pool, latest.id)) return;
   if (latest?.id) await broadcastTrade(pool, latest);
 }
