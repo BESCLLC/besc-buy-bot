@@ -5,7 +5,6 @@ import axios from 'axios';
 import Redis from 'ioredis';
 import PQueue from 'p-queue';
 
-// ---------- Config ----------
 const {
   TELEGRAM_TOKEN,
   GECKO_NETWORK = 'besc-hyperchain',
@@ -21,7 +20,6 @@ if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
 
-// Health HTTP server so Railway keeps us alive
 const app = express();
 app.get('/healthz', (_, res) => res.send('ok'));
 const PORT = process.env.PORT || 3000;
@@ -67,7 +65,6 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ---------- API Wrappers ----------
 async function fetchTopPoolForToken(tokenAddr) {
   const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
   const { data } = await axios.get(url, {
@@ -108,24 +105,21 @@ async function fetchTradesForPool(pool) {
 function normalizeTrades(items) {
   return (items || []).map(x => {
     const a = x.attributes || {};
-    const priceUsd = Number(a.price_usd ?? 0);
-    const amountUsd = Number(a.amount_usd ?? 0);
     return {
       id: x.id,
       tx: a.tx_hash,
-      priceUsd,
-      amountUsd,
+      priceUsd: Number(a.price_usd ?? 0),
+      amountUsd: Number(a.amount_usd ?? 0),
       amountToken: Number(a.amount_token ?? 0),
       tradeType: (a.trade_type || '').toLowerCase(),
       direction: a.direction || null,
       buyer: a.trader_address || null,
       ts: a.block_timestamp || a.timestamp,
-      needsPrice: (!priceUsd || !amountUsd)
+      needsPrice: (!a.price_usd || !a.amount_usd)
     };
   });
 }
 
-// ---------- Telegram Commands ----------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
   const token = match[1];
@@ -199,7 +193,6 @@ bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`);
 });
 
-// ---------- Poller ----------
 const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
 let poolRoundRobin = [];
 
@@ -284,17 +277,20 @@ async function tickOnce() {
       const poolRes = await axios.get(poolUrl, {
         headers: { 'Accept': 'application/json;version=20230302' }
       });
-
-      let price = Number(poolRes?.data?.data?.attributes?.price_in_usd ?? 0);
+      const attr = poolRes?.data?.data?.attributes || {};
+      let price = Number(attr.price_in_usd ?? 0);
 
       if (!price || price === 0) {
-        const baseToken = poolRes?.data?.data?.attributes?.base_token_address;
-        if (baseToken) {
-          const tokenPriceUrl = `${GT_BASE}/simple/networks/${GECKO_NETWORK}/token_price/${baseToken}`;
-          const priceRes = await axios.get(tokenPriceUrl, {
-            headers: { 'Accept': 'application/json;version=20230302' }
-          });
-          price = Number(priceRes?.data?.attributes?.price_usd ?? 0);
+        const basePriceQuote = Number(attr.base_token_price_in_quote_token ?? 0);
+        const quotePriceUsd = Number(attr.quote_token_price_in_usd ?? 0);
+        if (quotePriceUsd > 0 && basePriceQuote > 0) {
+          price = basePriceQuote * quotePriceUsd;
+          console.log(`[DEBUG] Derived USD price from quote: $${price}`);
+        } else if (basePriceQuote > 0) {
+          price = basePriceQuote;
+          console.log(`[DEBUG] Using relative price: ${price}`);
+        } else {
+          console.warn(`[DEBUG] No price data available for pool ${pool}`);
         }
       }
 
