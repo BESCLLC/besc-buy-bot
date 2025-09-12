@@ -278,14 +278,26 @@ async function tickOnce() {
   let trades = await fetchTradesForPool(pool);
   if (!trades.length) return;
 
-  // Fallback price fetch if trades lack USD values
   if (trades[0].needsPrice) {
     try {
       const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
-      const { data } = await axios.get(poolUrl, {
+      const poolRes = await axios.get(poolUrl, {
         headers: { 'Accept': 'application/json;version=20230302' }
       });
-      const price = Number(data?.data?.attributes?.price_in_usd ?? 0);
+
+      let price = Number(poolRes?.data?.data?.attributes?.price_in_usd ?? 0);
+
+      if (!price || price === 0) {
+        const baseToken = poolRes?.data?.data?.attributes?.base_token_address;
+        if (baseToken) {
+          const tokenPriceUrl = `${GT_BASE}/simple/networks/${GECKO_NETWORK}/token_price/${baseToken}`;
+          const priceRes = await axios.get(tokenPriceUrl, {
+            headers: { 'Accept': 'application/json;version=20230302' }
+          });
+          price = Number(priceRes?.data?.attributes?.price_usd ?? 0);
+        }
+      }
+
       if (price > 0) {
         trades = trades.map(t => ({
           ...t,
