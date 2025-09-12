@@ -100,7 +100,7 @@ async function fetchTradesForPool(pool) {
     });
     return items;
   } else {
-    // Free public: /pools/{pool}/swaps?limit=5 (fields vary, but include tx hash & usd)
+    // Free public: /pools/{pool}/trades?limit=5 (fields vary, but include tx hash & usd)
     const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/swaps?limit=5`;
     const { data } = await axios.get(url);
     const items = (data?.data || []).map(x => {
