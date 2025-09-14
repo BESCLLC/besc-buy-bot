@@ -25,8 +25,15 @@ app.listen(PORT, () => console.log('Health server on :' + PORT));
 
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const memoryStore = new Map();
-const pendingGif = new Map();
 
+// State maps for inline flows
+const pendingGif = new Map();        // chatId -> awaiting GIF upload
+const awaitingTokenInput = new Map(); // chatId -> settingsMessageId
+const awaitingMinBuyInput = new Map(); // chatId -> settingsMessageId
+const awaitingTierInput = new Map();   // chatId -> { which: 'small'|'large', msg: settingsMessageId }
+const awaitingRemoveChoice = new Map();// chatId -> settingsMessageId
+
+// -------- Config helpers --------
 function defaultChatConfig() {
   return {
     pools: [],
@@ -71,13 +78,14 @@ function formatUSD(n, maxFraction = 0) {
   }
   return n.toLocaleString(undefined, { maximumFractionDigits: maxFraction });
 }
+
 function adjustSupply(supplyLike, decimals = 18) {
   if (supplyLike == null) return 0;
   const str = String(supplyLike);
   if (str.includes('.') || str.toLowerCase().includes('e')) {
     const n = Number(str);
     return Number.isFinite(n) ? n : 0;
-  }
+    }
   if (/^\d+$/.test(str)) {
     const n = Number(str);
     if (!Number.isFinite(n)) return 0;
@@ -90,6 +98,7 @@ function adjustSupply(supplyLike, decimals = 18) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// -------- GeckoTerminal wrappers --------
 async function fetchTopPoolForToken(tokenAddr) {
   const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
   const { data } = await axios.get(url, {
@@ -97,7 +106,7 @@ async function fetchTopPoolForToken(tokenAddr) {
   });
   const pools = data?.data?.relationships?.top_pools?.data || [];
   if (!pools.length) return null;
-  const poolId = pools[0].id;
+  const poolId = pools[0].id;          // e.g. "besc-hyperchain_0xPOOL"
   const pool = poolId.split('_').pop();
   const symbol = data?.data?.attributes?.symbol || 'TOKEN';
   return { pool, symbol };
@@ -137,7 +146,228 @@ function normalizeTrades(items) {
   });
 }
 
-// ---------- Telegram Commands ----------
+// -------- Inline Settings Panel --------
+async function sendSettingsPanel(chatId, messageId = null) {
+  const cfg = await getChat(chatId);
+  const tokens = cfg.pools.length
+    ? cfg.pools.map(p => cfg.tokenSymbols[p] || (p.slice(0,6)+'…'+p.slice(-4))).join(', ')
+    : 'None';
+  const text =
+    `⚙️ <b>Settings Panel</b>\n` +
+    `<b>Tracking:</b> ${escapeHtml(tokens)}\n` +
+    `<b>Min Buy:</b> $${cfg.minBuyUsd}\n` +
+    `<b>Whale Tier:</b> $${cfg.tiers.large}  |  <b>Mid Tier:</b> $${cfg.tiers.small}\n` +
+    `<b>Sells:</b> ${cfg.showSells ? 'ON' : 'OFF'}\n` +
+    `<b>GIF:</b> ${cfg.gifFileId ? '✅ custom' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '➕ Add Token', callback_data: 'add_token' },
+       { text: '➖ Remove Token', callback_data: 'remove_token' }],
+      [{ text: '🎯 Min Buy', callback_data: 'set_minbuy' },
+       { text: '🐋 Whale Tier', callback_data: 'tier_menu' }],
+      [{ text: cfg.showSells ? '🔴 Hide Sells' : '🟢 Show Sells', callback_data: 'toggle_sells' }],
+      [{ text: '🎞 Set GIF', callback_data: 'set_gif' }],
+      [{ text: '📊 Status', callback_data: 'show_status' }]
+    ]
+  };
+
+  if (messageId) {
+    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: keyboard });
+  } else {
+    return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
+  }
+}
+
+bot.onText(/\/settings|\/start/, (msg) => sendSettingsPanel(msg.chat.id));
+
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const cfg = await getChat(chatId);
+
+  switch (query.data) {
+    case 'add_token':
+      awaitingTokenInput.set(chatId, query.message.message_id);
+      await bot.answerCallbackQuery(query.id);
+      await bot.sendMessage(chatId, 'Reply with token address (0x...) to add:');
+      break;
+
+    case 'remove_token': {
+      await bot.answerCallbackQuery(query.id);
+      if (!cfg.pools.length) {
+        await bot.sendMessage(chatId, 'No tokens to remove.');
+        return;
+      }
+      // Build per-pool remove buttons
+      const rows = cfg.pools.map(p => ([{ text: (cfg.tokenSymbols[p] || p.slice(0,6)+'…'+p.slice(-4)), callback_data: `rm:${p}` }]));
+      rows.push([{ text: '⬅️ Back', callback_data: 'back_to_settings' }]);
+      await bot.editMessageText('Select a token to remove:', {
+        chat_id: chatId,
+        message_id: query.message.message_id,
+        reply_markup: { inline_keyboard: rows }
+      });
+      awaitingRemoveChoice.set(chatId, query.message.message_id);
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  if (query.data.startsWith('rm:')) {
+    const pool = query.data.slice(3);
+    const cfg2 = await getChat(chatId);
+    if (cfg2.pools.includes(pool)) {
+      cfg2.pools = cfg2.pools.filter(p => p !== pool);
+      delete cfg2.tokenSymbols[pool];
+      await setChat(chatId, cfg2);
+      await bot.answerCallbackQuery(query.id, { text: 'Removed.' });
+    } else {
+      await bot.answerCallbackQuery(query.id, { text: 'Not found.' });
+    }
+    const msgId = awaitingRemoveChoice.get(chatId) || query.message.message_id;
+    awaitingRemoveChoice.delete(chatId);
+    await sendSettingsPanel(chatId, msgId);
+    return;
+  }
+
+  switch (query.data) {
+    case 'set_minbuy':
+      awaitingMinBuyInput.set(chatId, query.message.message_id);
+      await bot.answerCallbackQuery(query.id);
+      await bot.sendMessage(chatId, 'Reply with minimum buy USD value (e.g. 50):');
+      break;
+
+    case 'tier_menu':
+      await bot.answerCallbackQuery(query.id);
+      await bot.editMessageText(
+        `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: `Small: $${cfg.tiers.small}`, callback_data: 'set_tier_small' },
+               { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
+              [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
+            ]
+          }
+        }
+      );
+      break;
+
+    case 'set_tier_small':
+      awaitingTierInput.set(chatId, { which: 'small', msg: query.message.message_id });
+      await bot.answerCallbackQuery(query.id);
+      await bot.sendMessage(chatId, 'Reply with new SMALL tier value (USD):');
+      break;
+
+    case 'set_tier_large':
+      awaitingTierInput.set(chatId, { which: 'large', msg: query.message.message_id });
+      await bot.answerCallbackQuery(query.id);
+      await bot.sendMessage(chatId, 'Reply with new LARGE tier value (USD):');
+      break;
+
+    case 'toggle_sells':
+      cfg.showSells = !cfg.showSells;
+      await setChat(chatId, cfg);
+      await bot.answerCallbackQuery(query.id, { text: `Sell alerts ${cfg.showSells ? 'ON' : 'OFF'}` });
+      await sendSettingsPanel(chatId, query.message.message_id);
+      break;
+
+    case 'set_gif':
+      pendingGif.set(chatId, true);
+      await bot.answerCallbackQuery(query.id);
+      await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts (as an animation).');
+      break;
+
+    case 'show_status':
+      await bot.answerCallbackQuery(query.id);
+      await bot.sendMessage(chatId, 'Use /status to view full configuration.');
+      break;
+
+    case 'back_to_settings':
+      await bot.answerCallbackQuery(query.id);
+      await sendSettingsPanel(chatId, query.message.message_id);
+      break;
+  }
+});
+
+// Handle typed replies for Add Token / Min Buy / Tier
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+
+  // GIF upload flow (handled separately by 'animation' event)
+  if (msg.animation) return;
+
+  // Only process text replies for these flows
+  if (!msg.text) return;
+
+  // Add Token
+  if (awaitingTokenInput.has(chatId)) {
+    const token = msg.text.trim();
+    const isAddr = /^0x[a-fA-F0-9]{40}$/.test(token);
+    const msgId = awaitingTokenInput.get(chatId);
+    awaitingTokenInput.delete(chatId);
+    if (!isAddr) {
+      await bot.sendMessage(chatId, '❌ Invalid address. Please send a valid 0x token address.');
+      await sendSettingsPanel(chatId, msgId);
+      return;
+    }
+    const top = await fetchTopPoolForToken(token);
+    if (top) {
+      const cfg = await getChat(chatId);
+      if (!cfg.pools.includes(top.pool)) cfg.pools.push(top.pool);
+      cfg.tokenSymbols[top.pool] = top.symbol || 'TOKEN';
+      await setChat(chatId, cfg);
+      await bot.sendMessage(chatId, `✅ Tracking ${top.symbol} (${top.pool.slice(0,6)}…${top.pool.slice(-4)})`);
+      await sendSettingsPanel(chatId, msgId);
+    } else {
+      await bot.sendMessage(chatId, '❌ No pool found for that token on this network.');
+      await sendSettingsPanel(chatId, msgId);
+    }
+    return;
+  }
+
+  // Min Buy
+  if (awaitingMinBuyInput.has(chatId)) {
+    const val = Number(msg.text);
+    const msgId = awaitingMinBuyInput.get(chatId);
+    awaitingMinBuyInput.delete(chatId);
+    if (!Number.isFinite(val) || val < 0) {
+      await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.');
+      await sendSettingsPanel(chatId, msgId);
+      return;
+    }
+    const cfg = await getChat(chatId);
+    cfg.minBuyUsd = val;
+    await setChat(chatId, cfg);
+    await bot.sendMessage(chatId, `✅ Min buy set to $${val}`);
+    await sendSettingsPanel(chatId, msgId);
+    return;
+  }
+
+  // Tier input
+  if (awaitingTierInput.has(chatId)) {
+    const { which, msg: msgId } = awaitingTierInput.get(chatId);
+    awaitingTierInput.delete(chatId);
+    const val = Number(msg.text);
+    if (!Number.isFinite(val) || val < 0) {
+      await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.');
+      await sendSettingsPanel(chatId, msgId);
+      return;
+    }
+    const cfg = await getChat(chatId);
+    cfg.tiers[which] = val;
+    await setChat(chatId, cfg);
+    await bot.sendMessage(chatId, `✅ ${which.toUpperCase()} tier set to $${val}`);
+    await sendSettingsPanel(chatId, msgId);
+    return;
+  }
+});
+
+// -------- Backward-compatible commands --------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
   const token = match[1];
@@ -169,7 +399,7 @@ bot.onText(/\/remove (0x[a-fA-F0-9]{40})/, async (msg, match) => {
 bot.onText(/\/list/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  if (!cfg.pools.length) return bot.sendMessage(chatId, 'No pools yet. Add with /add 0xYourToken');
+  if (!cfg.pools.length) return bot.sendMessage(chatId, 'No pools yet. Add with /add 0xYourToken or use /settings → Add Token');
   const lines = cfg.pools.map(p => `• <code>${p}</code> (${escapeHtml(cfg.tokenSymbols[p] || 'TOKEN')})`);
   bot.sendMessage(chatId, `<b>Tracking:</b>\n${lines.join('\n')}`, { parse_mode: 'HTML' });
 });
@@ -183,43 +413,58 @@ bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`);
 });
 
-// ---- GIF Support
-bot.onText(/\/setgif$/, async (msg) => {
-  pendingGif.set(msg.chat.id, true);
-  bot.sendMessage(msg.chat.id, '📎 Send the GIF/animation you want to use for alerts.');
+bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (match[1]) {
+    const cfg = await getChat(chatId);
+    cfg.gifUrl = match[1];
+    cfg.gifFileId = null;
+    await setChat(chatId, cfg);
+    bot.sendMessage(chatId, '✅ GIF URL set.');
+  } else {
+    pendingGif.set(chatId, true);
+    bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts.');
+  }
 });
+
 bot.on('animation', async (msg) => {
-  if (!pendingGif.get(msg.chat.id)) return;
-  const cfg = await getChat(msg.chat.id);
+  const chatId = msg.chat.id;
+  if (!pendingGif.get(chatId)) return;
+  const cfg = await getChat(chatId);
   cfg.gifFileId = msg.animation.file_id;
   cfg.gifUrl = null;
-  await setChat(msg.chat.id, cfg);
-  pendingGif.delete(msg.chat.id);
-  bot.sendMessage(msg.chat.id, '✅ GIF saved! Will play on every buy alert.');
+  await setChat(chatId, cfg);
+  pendingGif.delete(chatId);
+  bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert.');
 });
 
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const which = match[1];
+  const value = match[2];
   const cfg = await getChat(chatId);
-  cfg.emoji[match[1]] = match[2];
+  cfg.emoji[which] = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ ${match[1]} emoji → ${match[2]}`);
+  bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`);
 });
 
 bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const which = match[1];
+  const value = Number(match[2]);
   const cfg = await getChat(chatId);
-  cfg.tiers[match[1]] = Number(match[2]);
+  cfg.tiers[which] = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ ${match[1]} buy threshold set to $${match[2]}`);
+  bot.sendMessage(chatId, `✅ ${which} buy threshold set to $${value}`);
 });
 
 bot.onText(/\/showsells (on|off)/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const value = match[1].toLowerCase() === 'on';
   const cfg = await getChat(chatId);
-  cfg.showSells = match[1].toLowerCase() === 'on';
+  cfg.showSells = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ Sell alerts are now ${cfg.showSells ? 'ON' : 'OFF'}`);
+  bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`);
 });
 
 bot.onText(/\/status/, async (msg) => {
@@ -227,12 +472,19 @@ bot.onText(/\/status/, async (msg) => {
   const cfg = await getChat(chatId);
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
   bot.sendMessage(chatId,
-    `<b>Current Config</b>\nPools:\n${pools}\n\nMin Buy: $${cfg.minBuyUsd}\nSells: ${cfg.showSells ? 'ON' : 'OFF'}\nGIF: ${cfg.gifFileId ? '✅ custom set' : cfg.gifUrl ? cfg.gifUrl : '❌ none'}\nWhale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}`,
-    { parse_mode: 'HTML' });
+    `<b>Current Config</b>\n` +
+    `Pools:\n${pools}\n\n` +
+    `Min Buy: $${cfg.minBuyUsd}\n` +
+    `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
+    `GIF: ${cfg.gifFileId ? '✅ custom set' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
+    `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}`,
+    { parse_mode: 'HTML' }
+  );
 });
 
 bot.onText(/\/ping/, (msg) => bot.sendMessage(msg.chat.id, '✅ Bot is online and running.'));
 
+// -------- Pool polling + broadcasting --------
 const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
 let poolRoundRobin = [];
 
@@ -278,24 +530,27 @@ async function broadcastTrade(pool, trade) {
   for (const k of keys) {
     const chatId = Number(k.split(':')[1]);
     const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
-    if (!cfg.pools.includes(pool)) continue;
+    if (!cfg || !cfg.pools.includes(pool)) continue;
     if (trade.tradeType === 'sell' && cfg.showSells === false) continue;
+
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
 
     let extraData = '';
     try {
       const tokenAddr = trade.toToken || trade.fromToken;
-      const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
+      const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr?.toLowerCase()}`;
       const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
       const [tokenRes, poolRes] = await Promise.all([
         axios.get(tokenUrl, { headers: { 'Accept': 'application/json;version=20230302' } }),
         axios.get(poolUrl, { headers: { 'Accept': 'application/json;version=20230302' } })
       ]);
+
       const tokenAttr = tokenRes?.data?.data?.attributes || {};
       const poolAttr = poolRes?.data?.data?.attributes || {};
       const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
 
+      // MC/FDV logic
       let mcLabel = 'MC';
       let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
       if (!mcValue && price > 0) {
@@ -312,6 +567,7 @@ async function broadcastTrade(pool, trade) {
           }
         }
       }
+
       if (mcValue && mcValue > 0) extraData += `📊 ${mcLabel}: $${formatUSD(mcValue)}\n`;
       if (poolAttr.reserve_in_usd) extraData += `💧 Liquidity: $${formatUSD(Number(poolAttr.reserve_in_usd))}\n`;
       if (poolAttr.volume_usd_24h) extraData += `📈 24h Vol: $${formatUSD(Number(poolAttr.volume_usd_24h))}\n`;
@@ -319,19 +575,24 @@ async function broadcastTrade(pool, trade) {
         const pct = Number(tokenAttr.price_percent_change_24h);
         if (Number.isFinite(pct)) extraData += `📊 24h Change: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%\n`;
       }
+      if (tokenAttr.unique_wallet_count) {
+        extraData += `👥 Holders: ${tokenAttr.unique_wallet_count}\n`;
+      }
     } catch (e) {
       console.warn(`[DEBUG] Extra data fetch failed:`, e.message);
     }
 
-    const emoji = trade.tradeType === 'sell' ? '🔴' : tierEmoji(cfg, usd);
-    const action = trade.tradeType === 'sell' ? 'SELL' : 'BUY';
+    const isSell = trade.tradeType === 'sell';
+    const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
+    const action = isSell ? 'SELL' : 'BUY';
     const symbol = cfg.tokenSymbols[pool] || 'TOKEN';
     const priceStr = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
     const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
     const txUrl = EXPLORER_TX_URL + trade.tx;
     const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${pool}`;
 
-    const caption = `${emoji} <b>${action}</b> • <b>${escapeHtml(symbol)}</b>\n` +
+    const caption =
+      `${emoji} <b>${action}</b> • <b>${escapeHtml(symbol)}</b>\n` +
       `💵 <b>$${usd.toFixed(2)}</b>\n` +
       `🧮 ${amountTok} ${escapeHtml(symbol)} @ ${priceStr}\n` +
       extraData +
@@ -340,11 +601,15 @@ async function broadcastTrade(pool, trade) {
 
     await safeSend(chatId, async () => {
       if (cfg.gifFileId) {
-        await bot.sendAnimation(chatId, cfg.gifFileId, { caption, parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] } });
+        await bot.sendAnimation(chatId, cfg.gifFileId, {
+          caption, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
+        });
       } else if (cfg.gifUrl) {
-        await bot.sendAnimation(chatId, cfg.gifUrl, { caption, parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] } });
+        await bot.sendAnimation(chatId, cfg.gifUrl, {
+          caption, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
+        });
       } else {
         await bot.sendMessage(chatId, caption, {
           parse_mode: 'HTML',
