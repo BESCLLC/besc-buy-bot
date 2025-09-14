@@ -17,7 +17,6 @@ if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
-const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
 
 const app = express();
 app.get('/healthz', (_, res) => res.send('ok'));
@@ -27,14 +26,12 @@ app.listen(PORT, () => console.log('Health server on :' + PORT));
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const memoryStore = new Map();
 
-// State maps
-const pendingGif = new Map();
-const awaitingTokenInput = new Map();
-const awaitingMinBuyInput = new Map();
-const awaitingTierInput = new Map();
-const awaitingRemoveChoice = new Map();
-const awaitingDecimalsInput = new Map();
-const compWizard = new Map();
+// State maps for inline flows
+const pendingGif = new Map();        // chatId -> awaiting GIF upload
+const awaitingTokenInput = new Map(); // chatId -> settingsMessageId
+const awaitingMinBuyInput = new Map(); // chatId -> settingsMessageId
+const awaitingTierInput = new Map();   // chatId -> { which: 'small'|'large', msg: settingsMessageId }
+const awaitingRemoveChoice = new Map();// chatId -> settingsMessageId
 
 // -------- Config helpers --------
 function defaultChatConfig() {
@@ -46,9 +43,7 @@ function defaultChatConfig() {
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
     tokenSymbols: {},
-    decimalsOverrides: {},
-    showSells: false,
-    activeCompetition: null
+    showSells: false
   };
 }
 
@@ -90,7 +85,7 @@ function adjustSupply(supplyLike, decimals = 18) {
   if (str.includes('.') || str.toLowerCase().includes('e')) {
     const n = Number(str);
     return Number.isFinite(n) ? n : 0;
-  }
+    }
   if (/^\d+$/.test(str)) {
     const n = Number(str);
     if (!Number.isFinite(n)) return 0;
@@ -106,20 +101,15 @@ function adjustSupply(supplyLike, decimals = 18) {
 // -------- GeckoTerminal wrappers --------
 async function fetchTopPoolForToken(tokenAddr) {
   const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
-  try {
-    const { data } = await axios.get(url, {
-      headers: { 'Accept': 'application/json;version=20230302' }
-    });
-    const pools = data?.data?.relationships?.top_pools?.data || [];
-    if (!pools.length) return null;
-    const poolId = pools[0].id;
-    const pool = poolId.split('_').pop();
-    const symbol = data?.data?.attributes?.symbol || 'TOKEN';
-    return { pool, symbol };
-  } catch (e) {
-    console.error(`[GeckoTerminal] Failed to fetch top pool for ${tokenAddr}:`, e.message);
-    return null;
-  }
+  const { data } = await axios.get(url, {
+    headers: { 'Accept': 'application/json;version=20230302' }
+  });
+  const pools = data?.data?.relationships?.top_pools?.data || [];
+  if (!pools.length) return null;
+  const poolId = pools[0].id;          // e.g. "besc-hyperchain_0xPOOL"
+  const pool = poolId.split('_').pop();
+  const symbol = data?.data?.attributes?.symbol || 'TOKEN';
+  return { pool, symbol };
 }
 
 async function fetchTradesForPool(pool) {
@@ -166,10 +156,9 @@ async function sendSettingsPanel(chatId, messageId = null) {
     `⚙️ <b>Settings Panel</b>\n` +
     `<b>Tracking:</b> ${escapeHtml(tokens)}\n` +
     `<b>Min Buy:</b> $${cfg.minBuyUsd}\n` +
-    `<b>Whale Tier:</b> $${cfg.tiers.large} | Mid $${cfg.tiers.small}\n` +
+    `<b>Whale Tier:</b> $${cfg.tiers.large}  |  <b>Mid Tier:</b> $${cfg.tiers.small}\n` +
     `<b>Sells:</b> ${cfg.showSells ? 'ON' : 'OFF'}\n` +
-    `<b>GIF:</b> ${cfg.gifFileId ? '✅ custom' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
-    `<b>Competition:</b> ${cfg.activeCompetition ? '🏆 ACTIVE' : '—'}`;
+    `<b>GIF:</b> ${cfg.gifFileId ? '✅ custom' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}`;
 
   const keyboard = {
     inline_keyboard: [
@@ -177,14 +166,9 @@ async function sendSettingsPanel(chatId, messageId = null) {
        { text: '➖ Remove Token', callback_data: 'remove_token' }],
       [{ text: '🎯 Min Buy', callback_data: 'set_minbuy' },
        { text: '🐋 Whale Tier', callback_data: 'tier_menu' }],
-      [{ text: '🔢 Set Decimals', callback_data: 'set_decimals' }],
       [{ text: cfg.showSells ? '🔴 Hide Sells' : '🟢 Show Sells', callback_data: 'toggle_sells' }],
       [{ text: '🎞 Set GIF', callback_data: 'set_gif' }],
-      [{ text: '🏆 Start Competition', callback_data: 'start_comp' },
-       { text: '📊 Leaderboard', callback_data: 'show_leaderboard' },
-       { text: '🛑 End Competition', callback_data: 'end_comp' }],
-      [{ text: '📊 Status', callback_data: 'show_status' }],
-      [{ text: '✅ Done', callback_data: 'close_settings' }]
+      [{ text: '📊 Status', callback_data: 'show_status' }]
     ]
   };
 
@@ -195,25 +179,26 @@ async function sendSettingsPanel(chatId, messageId = null) {
   }
 }
 
-// -------- Handlers --------
 bot.onText(/\/settings|\/start/, (msg) => sendSettingsPanel(msg.chat.id));
 
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const cfg = await getChat(chatId);
-  await bot.answerCallbackQuery(query.id);
 
   switch (query.data) {
     case 'add_token':
       awaitingTokenInput.set(chatId, query.message.message_id);
+      await bot.answerCallbackQuery(query.id);
       await bot.sendMessage(chatId, 'Reply with token address (0x...) to add:');
       break;
 
-    case 'remove_token':
+    case 'remove_token': {
+      await bot.answerCallbackQuery(query.id);
       if (!cfg.pools.length) {
         await bot.sendMessage(chatId, 'No tokens to remove.');
         return;
       }
+      // Build per-pool remove buttons
       const rows = cfg.pools.map(p => ([{ text: (cfg.tokenSymbols[p] || p.slice(0,6)+'…'+p.slice(-4)), callback_data: `rm:${p}` }]));
       rows.push([{ text: '⬅️ Back', callback_data: 'back_to_settings' }]);
       await bot.editMessageText('Select a token to remove:', {
@@ -223,16 +208,38 @@ bot.on('callback_query', async (query) => {
       });
       awaitingRemoveChoice.set(chatId, query.message.message_id);
       break;
+    }
 
-    case 'close_settings':
-      return bot.deleteMessage(chatId, query.message.message_id);
+    default:
+      break;
+  }
 
+  if (query.data.startsWith('rm:')) {
+    const pool = query.data.slice(3);
+    const cfg2 = await getChat(chatId);
+    if (cfg2.pools.includes(pool)) {
+      cfg2.pools = cfg2.pools.filter(p => p !== pool);
+      delete cfg2.tokenSymbols[pool];
+      await setChat(chatId, cfg2);
+      await bot.answerCallbackQuery(query.id, { text: 'Removed.' });
+    } else {
+      await bot.answerCallbackQuery(query.id, { text: 'Not found.' });
+    }
+    const msgId = awaitingRemoveChoice.get(chatId) || query.message.message_id;
+    awaitingRemoveChoice.delete(chatId);
+    await sendSettingsPanel(chatId, msgId);
+    return;
+  }
+
+  switch (query.data) {
     case 'set_minbuy':
       awaitingMinBuyInput.set(chatId, query.message.message_id);
+      await bot.answerCallbackQuery(query.id);
       await bot.sendMessage(chatId, 'Reply with minimum buy USD value (e.g. 50):');
       break;
 
     case 'tier_menu':
+      await bot.answerCallbackQuery(query.id);
       await bot.editMessageText(
         `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
         {
@@ -252,17 +259,14 @@ bot.on('callback_query', async (query) => {
 
     case 'set_tier_small':
       awaitingTierInput.set(chatId, { which: 'small', msg: query.message.message_id });
+      await bot.answerCallbackQuery(query.id);
       await bot.sendMessage(chatId, 'Reply with new SMALL tier value (USD):');
       break;
 
     case 'set_tier_large':
       awaitingTierInput.set(chatId, { which: 'large', msg: query.message.message_id });
+      await bot.answerCallbackQuery(query.id);
       await bot.sendMessage(chatId, 'Reply with new LARGE tier value (USD):');
-      break;
-
-    case 'set_decimals':
-      awaitingDecimalsInput.set(chatId, query.message.message_id);
-      await bot.sendMessage(chatId, 'Reply with token address and decimals (e.g. `0x1234... 18`):');
       break;
 
     case 'toggle_sells':
@@ -274,75 +278,33 @@ bot.on('callback_query', async (query) => {
 
     case 'set_gif':
       pendingGif.set(chatId, true);
+      await bot.answerCallbackQuery(query.id);
       await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts (as an animation).');
       break;
 
     case 'show_status':
+      await bot.answerCallbackQuery(query.id);
       await bot.sendMessage(chatId, 'Use /status to view full configuration.');
       break;
 
     case 'back_to_settings':
+      await bot.answerCallbackQuery(query.id);
       await sendSettingsPanel(chatId, query.message.message_id);
-      break;
-
-    case 'start_comp':
-      compWizard.set(chatId, { step: 1, data: {} });
-      await bot.sendMessage(chatId, '🏆 Enter duration (minutes):');
-      break;
-
-    case 'show_leaderboard':
-      await postLeaderboard(chatId);
-      break;
-
-    case 'end_comp':
-      if (cfg.activeCompetition) {
-        await postLeaderboard(chatId, true);
-        cfg.activeCompetition = null;
-        await setChat(chatId, cfg);
-        await bot.sendMessage(chatId, '🛑 Competition ended.');
-      } else {
-        await bot.sendMessage(chatId, 'No active competition.');
-      }
-      break;
-
-    default:
-      if (query.data.startsWith('rm:')) {
-        const pool = query.data.slice(3);
-        const cfg2 = await getChat(chatId);
-        if (cfg2.pools.includes(pool)) {
-          cfg2.pools = cfg2.pools.filter(p => p !== pool);
-          delete cfg2.tokenSymbols[pool];
-          await setChat(chatId, cfg2);
-          await bot.answerCallbackQuery(query.id, { text: 'Removed.' });
-        } else {
-          await bot.answerCallbackQuery(query.id, { text: 'Not found.' });
-        }
-        const msgId = awaitingRemoveChoice.get(chatId) || query.message.message_id;
-        awaitingRemoveChoice.delete(chatId);
-        await sendSettingsPanel(chatId, msgId);
-      }
       break;
   }
 });
 
-// -------- Message handlers --------
+// Handle typed replies for Add Token / Min Buy / Tier
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
 
-  if (msg.animation) {
-    if (!pendingGif.get(chatId)) return;
-    const cfg = await getChat(chatId);
-    cfg.gifFileId = msg.animation.file_id;
-    cfg.gifUrl = null;
-    await setChat(chatId, cfg);
-    pendingGif.delete(chatId);
-    await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert.');
-    await sendSettingsPanel(chatId);
-    return;
-  }
+  // GIF upload flow (handled separately by 'animation' event)
+  if (msg.animation) return;
 
+  // Only process text replies for these flows
   if (!msg.text) return;
 
+  // Add Token
   if (awaitingTokenInput.has(chatId)) {
     const token = msg.text.trim();
     const isAddr = /^0x[a-fA-F0-9]{40}$/.test(token);
@@ -368,6 +330,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // Min Buy
   if (awaitingMinBuyInput.has(chatId)) {
     const val = Number(msg.text);
     const msgId = awaitingMinBuyInput.get(chatId);
@@ -385,6 +348,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // Tier input
   if (awaitingTierInput.has(chatId)) {
     const { which, msg: msgId } = awaitingTierInput.get(chatId);
     awaitingTierInput.delete(chatId);
@@ -400,63 +364,6 @@ bot.on('message', async (msg) => {
     await bot.sendMessage(chatId, `✅ ${which.toUpperCase()} tier set to $${val}`);
     await sendSettingsPanel(chatId, msgId);
     return;
-  }
-
-  if (awaitingDecimalsInput.has(chatId)) {
-    const msgId = awaitingDecimalsInput.get(chatId);
-    awaitingDecimalsInput.delete(chatId);
-    const [addr, dec] = msg.text.split(/\s+/);
-    if (!/^0x[a-fA-F0-9]{40}$/.test(addr) || isNaN(Number(dec))) {
-      await bot.sendMessage(chatId, '❌ Format must be: 0xTOKENADDRESS DECIMALS');
-      await sendSettingsPanel(chatId, msgId);
-      return;
-    }
-    const cfg = await getChat(chatId);
-    cfg.decimalsOverrides[addr.toLowerCase()] = Number(dec);
-    await setChat(chatId, cfg);
-    await bot.sendMessage(chatId, `✅ Decimals for ${addr} set to ${dec}`);
-    await sendSettingsPanel(chatId, msgId);
-    return;
-  }
-
-  const wizard = compWizard.get(chatId);
-  if (wizard) {
-    const data = wizard.data;
-    if (wizard.step === 1) {
-      const minutes = Number(msg.text);
-      if (!minutes || minutes < 1) return bot.sendMessage(chatId, 'Enter a valid duration in minutes:');
-      data.duration = minutes;
-      wizard.step = 2;
-      return bot.sendMessage(chatId, 'Enter minimum buy USD to qualify:');
-    }
-    if (wizard.step === 2) {
-      data.minBuyUsd = Number(msg.text) || 0;
-      wizard.step = 3;
-      return bot.sendMessage(chatId, 'Enter prize for 🥇 1st place:');
-    }
-    if (wizard.step === 3) {
-      data.prize1 = msg.text;
-      wizard.step = 4;
-      return bot.sendMessage(chatId, 'Enter prizes for 🥈 2nd and 🥉 3rd (comma separated):');
-    }
-    if (wizard.step === 4) {
-      const [p2, p3] = msg.text.split(',').map(x => x.trim());
-      data.prizes = [data.prize1, p2, p3];
-      const cfg = await getChat(chatId);
-      cfg.activeCompetition = {
-        endsAt: Date.now() + data.duration * 60 * 1000,
-        minBuyUsd: data.minBuyUsd,
-        prizes: data.prizes,
-        leaderboard: {}
-      };
-      await setChat(chatId, cfg);
-      compWizard.delete(chatId);
-      await bot.sendMessage(chatId,
-        `🎉 Big Buy Competition Started!\n⏳ ${data.duration} min\n💵 Min Buy $${data.minBuyUsd}\n` +
-        `🥇 ${data.prizes[0]}\n🥈 ${data.prizes[1]}\n🥉 ${data.prizes[2]}`);
-      await sendSettingsPanel(chatId);
-      return;
-    }
   }
 });
 
@@ -564,50 +471,21 @@ bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
-  const statusText =
+  bot.sendMessage(chatId,
     `<b>Current Config</b>\n` +
     `Pools:\n${pools}\n\n` +
     `Min Buy: $${cfg.minBuyUsd}\n` +
     `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
-    `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
     `GIF: ${cfg.gifFileId ? '✅ custom set' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
-    `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
-  bot.sendMessage(chatId, statusText, { parse_mode: 'HTML' });
+    `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}`,
+    { parse_mode: 'HTML' }
+  );
 });
 
 bot.onText(/\/ping/, (msg) => bot.sendMessage(msg.chat.id, '✅ Bot is online and running.'));
 
-// -------- Leaderboard + Competition --------
-async function postLeaderboard(chatId, final = false) {
-  const cfg = await getChat(chatId);
-  if (!cfg.activeCompetition) return;
-  const lb = Object.entries(cfg.activeCompetition.leaderboard || {}).sort((a,b) => b[1] - a[1]);
-  if (!lb.length) return bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.');
-  let msg = final ? '🎉 <b>Big Buy Competition Over!</b>\n\n' : '📊 <b>Current Leaderboard</b>\n\n';
-  lb.slice(0, 10).forEach(([wallet, amount], i) => {
-    msg += `${['🥇','🥈','🥉'][i] || (i+1)+'.'} ${wallet.slice(0,6)}…${wallet.slice(-4)} — $${amount.toFixed(2)}\n`;
-  });
-  if (final && cfg.activeCompetition.prizes?.length) {
-    msg += `\n🏆 Prizes:\n🥇 ${cfg.activeCompetition.prizes[0] || '-'}\n🥈 ${cfg.activeCompetition.prizes[1] || '-'}\n🥉 ${cfg.activeCompetition.prizes[2] || '-'}`;
-  }
-  await bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
-}
-
-// -------- Auto-End Checker --------
-setInterval(async () => {
-  const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
-  for (const k of keys) {
-    const chatId = Number(k.split(':')[1]);
-    const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
-    if (cfg?.activeCompetition && Date.now() >= cfg.activeCompetition.endsAt) {
-      await postLeaderboard(chatId, true);
-      cfg.activeCompetition = null;
-      await setChat(chatId, cfg);
-    }
-  }
-}, 30000);
-
 // -------- Pool polling + broadcasting --------
+const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
 let poolRoundRobin = [];
 
 async function refreshPoolSet() {
@@ -658,42 +536,31 @@ async function broadcastTrade(pool, trade) {
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
 
-    if (cfg.activeCompetition) {
-      cfg.activeCompetition.leaderboard[trade.buyer || trade.tx] =
-        (cfg.activeCompetition.leaderboard[trade.buyer || trade.tx] || 0) + usd;
-      await setChat(chatId, cfg);
-    }
-
     let extraData = '';
-    let price = Number(trade.priceUsd || 0);
     try {
       const tokenAddr = trade.toToken || trade.fromToken;
-      let tokenAttr = {};
-      let poolAttr = {};
-      if (tokenAddr) {
-        const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
-        const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
-        const [tokenRes, poolRes] = await Promise.all([
-          axios.get(tokenUrl, { headers: { 'Accept': 'application/json;version=20230302' } }).catch(() => ({})),
-          axios.get(poolUrl, { headers: { 'Accept': 'application/json;version=20230302' } }).catch(() => ({}))
-        ]);
-        tokenAttr = tokenRes?.data?.data?.attributes || {};
-        poolAttr = poolRes?.data?.data?.attributes || {};
-      }
+      const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr?.toLowerCase()}`;
+      const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
+      const [tokenRes, poolRes] = await Promise.all([
+        axios.get(tokenUrl, { headers: { 'Accept': 'application/json;version=20230302' } }),
+        axios.get(poolUrl, { headers: { 'Accept': 'application/json;version=20230302' } })
+      ]);
 
-      const decimals = cfg.decimalsOverrides[tokenAddr?.toLowerCase()] ?? tokenAttr.decimals ?? 18;
-      price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
+      const tokenAttr = tokenRes?.data?.data?.attributes || {};
+      const poolAttr = poolRes?.data?.data?.attributes || {};
+      const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
 
+      // MC/FDV logic
       let mcLabel = 'MC';
       let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
       if (!mcValue && price > 0) {
-        const circ = adjustSupply(tokenAttr.circulating_supply, decimals);
+        const circ = adjustSupply(tokenAttr.circulating_supply, tokenAttr.decimals ?? 18);
         if (circ > 0) mcValue = circ * price;
         else if (tokenAttr.fdv_usd) {
           mcValue = Number(tokenAttr.fdv_usd);
           mcLabel = 'FDV';
         } else {
-          const total = adjustSupply(tokenAttr.total_supply, decimals);
+          const total = adjustSupply(tokenAttr.total_supply, tokenAttr.decimals ?? 18);
           if (total > 0) {
             mcValue = total * price;
             mcLabel = 'FDV';
@@ -701,8 +568,8 @@ async function broadcastTrade(pool, trade) {
         }
       }
 
-      extraData += `📊 ${mcLabel}: ${mcValue > 0 ? '$' + formatUSD(mcValue) : '—'}\n`;
-      extraData += `💧 Liquidity: ${poolAttr.reserve_in_usd ? '$' + formatUSD(Number(poolAttr.reserve_in_usd)) : '—'}\n`;
+      if (mcValue && mcValue > 0) extraData += `📊 ${mcLabel}: $${formatUSD(mcValue)}\n`;
+      if (poolAttr.reserve_in_usd) extraData += `💧 Liquidity: $${formatUSD(Number(poolAttr.reserve_in_usd))}\n`;
       if (poolAttr.volume_usd_24h) extraData += `📈 24h Vol: $${formatUSD(Number(poolAttr.volume_usd_24h))}\n`;
       if (tokenAttr.price_percent_change_24h != null) {
         const pct = Number(tokenAttr.price_percent_change_24h);
@@ -713,14 +580,13 @@ async function broadcastTrade(pool, trade) {
       }
     } catch (e) {
       console.warn(`[DEBUG] Extra data fetch failed:`, e.message);
-      extraData += `📊 MC: —\n💧 Liquidity: —\n`;
     }
 
     const isSell = trade.tradeType === 'sell';
     const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
     const action = isSell ? 'SELL' : 'BUY';
     const symbol = cfg.tokenSymbols[pool] || 'TOKEN';
-    const priceStr = price ? `$${price.toFixed(6)}` : '—';
+    const priceStr = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
     const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
     const txUrl = EXPLORER_TX_URL + trade.tx;
     const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${pool}`;
