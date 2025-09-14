@@ -25,12 +25,14 @@ app.listen(PORT, () => console.log('Health server on :' + PORT));
 
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const memoryStore = new Map();
+const pendingGif = new Map(); // tracks which chats are waiting for a gif
 
 function defaultChatConfig() {
   return {
     pools: [],
     minBuyUsd: 0,
     gifUrl: null,
+    gifFileId: null,
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
     tokenSymbols: {},
@@ -60,6 +62,33 @@ function tierEmoji(cfg, usd) {
 
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Helpers for MC formatting
+function formatUSD(n, maxFraction = 0) {
+  if (!Number.isFinite(n)) return '—';
+  if (n >= 100000) {
+    return Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 2 }).format(n);
+  }
+  return n.toLocaleString(undefined, { maximumFractionDigits: maxFraction });
+}
+function adjustSupply(supplyLike, decimals = 18) {
+  if (supplyLike == null) return 0;
+  const str = String(supplyLike);
+  if (str.includes('.') || str.toLowerCase().includes('e')) {
+    const n = Number(str);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if (/^\d+$/.test(str)) {
+    const n = Number(str);
+    if (!Number.isFinite(n)) return 0;
+    if (str.length > (Number(decimals) + 2)) {
+      return n / Math.pow(10, Number(decimals));
+    }
+    return n;
+  }
+  const n = Number(str);
+  return Number.isFinite(n) ? n : 0;
 }
 
 async function fetchTopPoolForToken(tokenAddr) {
@@ -165,12 +194,22 @@ bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`);
 });
 
-bot.onText(/\/setgif (https?:\/\/\S+)/, async (msg, match) => {
+// ---- GIF Support (file_id or URL)
+bot.onText(/\/setgif$/, async (msg) => {
   const chatId = msg.chat.id;
+  pendingGif.set(chatId, true);
+  bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts.');
+});
+
+bot.on('animation', async (msg) => {
+  const chatId = msg.chat.id;
+  if (!pendingGif.get(chatId)) return;
   const cfg = await getChat(chatId);
-  cfg.gifUrl = match[1];
+  cfg.gifFileId = msg.animation.file_id;
+  cfg.gifUrl = null;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ GIF set.`);
+  pendingGif.delete(chatId);
+  bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert.');
 });
 
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
@@ -183,6 +222,16 @@ bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`);
 });
 
+bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const which = match[1];
+  const value = Number(match[2]);
+  const cfg = await getChat(chatId);
+  cfg.tiers[which] = value;
+  await setChat(chatId, cfg);
+  bot.sendMessage(chatId, `✅ ${which} buy threshold set to $${value}`);
+});
+
 bot.onText(/\/showsells (on|off)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const value = match[1].toLowerCase() === 'on';
@@ -190,6 +239,26 @@ bot.onText(/\/showsells (on|off)/, async (msg, match) => {
   cfg.showSells = value;
   await setChat(chatId, cfg);
   bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`);
+});
+
+// ---- /status and /ping
+bot.onText(/\/status/, async (msg) => {
+  const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
+  bot.sendMessage(chatId,
+    `<b>Current Config</b>\n` +
+    `Pools:\n${pools}\n\n` +
+    `Min Buy: $${cfg.minBuyUsd}\n` +
+    `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
+    `GIF: ${cfg.gifFileId ? '✅ custom set' : cfg.gifUrl ? cfg.gifUrl : '❌ none'}\n` +
+    `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.onText(/\/ping/, (msg) => {
+  bot.sendMessage(msg.chat.id, '✅ Bot is online and running smoothly.');
 });
 
 const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
@@ -228,6 +297,7 @@ async function broadcastTrade(pool, trade) {
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
 
+    // --- Fetch MC, Liq, Volume, Change
     let extraData = '';
     try {
       const tokenAddr = trade.toToken || trade.fromToken;
@@ -240,27 +310,30 @@ async function broadcastTrade(pool, trade) {
 
       const tokenAttr = tokenRes?.data?.data?.attributes || {};
       const poolAttr = poolRes?.data?.data?.attributes || {};
-      const supplyRaw = Number(tokenAttr.total_supply ?? 0);
-      const decimals = Number(tokenAttr.decimals ?? 18);
-      const price = trade.priceUsd || 0;
+      const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
 
-      if (supplyRaw > 0 && price > 0) {
-        const circulatingSupply = supplyRaw / (10 ** decimals);
-        const mc = circulatingSupply * price;
-        extraData += `📊 MC: $${mc.toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
+      let mcLabel = 'MC';
+      let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
+      if (!mcValue && price > 0) {
+        const circ = adjustSupply(tokenAttr.circulating_supply, tokenAttr.decimals ?? 18);
+        if (circ > 0) mcValue = circ * price;
+        else if (tokenAttr.fdv_usd) {
+          mcValue = Number(tokenAttr.fdv_usd);
+          mcLabel = 'FDV';
+        } else {
+          const total = adjustSupply(tokenAttr.total_supply, tokenAttr.decimals ?? 18);
+          if (total > 0) {
+            mcValue = total * price;
+            mcLabel = 'FDV';
+          }
+        }
       }
-      if (tokenAttr.fdv_usd) {
-        extraData += `🏷 FDV: $${Number(tokenAttr.fdv_usd).toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
-      }
-      if (poolAttr.reserve_in_usd) {
-        extraData += `💧 Liquidity: $${Number(poolAttr.reserve_in_usd).toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
-      }
-      if (poolAttr.volume_usd_24h) {
-        extraData += `📈 24h Vol: $${Number(poolAttr.volume_usd_24h).toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
-      }
-      if (tokenAttr.price_percent_change_24h) {
+      if (mcValue && mcValue > 0) extraData += `📊 ${mcLabel}: $${formatUSD(mcValue)}\n`;
+      if (poolAttr.reserve_in_usd) extraData += `💧 Liquidity: $${formatUSD(Number(poolAttr.reserve_in_usd))}\n`;
+      if (poolAttr.volume_usd_24h) extraData += `📈 24h Vol: $${formatUSD(Number(poolAttr.volume_usd_24h))}\n`;
+      if (tokenAttr.price_percent_change_24h != null) {
         const pct = Number(tokenAttr.price_percent_change_24h);
-        extraData += `📊 24h Change: ${pct>0?`+${pct.toFixed(2)}`:pct.toFixed(2)}%\n`;
+        if (Number.isFinite(pct)) extraData += `📊 24h Change: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%\n`;
       }
     } catch (e) {
       console.warn(`[DEBUG] Extra data fetch failed:`, e.message);
@@ -269,7 +342,6 @@ async function broadcastTrade(pool, trade) {
     const isSell = trade.tradeType === 'sell';
     const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
     const action = isSell ? 'SELL' : 'BUY';
-
     const symbol = cfg.tokenSymbols[pool] || 'TOKEN';
     const priceStr = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
     const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
@@ -292,7 +364,8 @@ async function broadcastTrade(pool, trade) {
       ]] }
     };
 
-    if (cfg.gifUrl) await bot.sendAnimation(chatId, cfg.gifUrl, { caption, ...markup });
+    if (cfg.gifFileId) await bot.sendAnimation(chatId, cfg.gifFileId, { caption, ...markup });
+    else if (cfg.gifUrl) await bot.sendAnimation(chatId, cfg.gifUrl, { caption, ...markup });
     else await bot.sendMessage(chatId, caption, markup);
   }
 }
@@ -304,8 +377,6 @@ async function tickOnce() {
 
   const trades = await fetchTradesForPool(pool);
   if (!trades.length) return;
-
-  console.log(`[DEBUG] Pool ${pool} returned ${trades.length} trades, latest USD: $${trades[0].amountUsd}`);
   const latest = trades[0];
   if (latest?.id && await seen(pool, latest.id)) return;
   if (latest?.id) await broadcastTrade(pool, latest);
