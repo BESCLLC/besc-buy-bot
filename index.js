@@ -170,6 +170,118 @@ async function sendSettingsPanel(chatId, messageId = null) {
     : bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
 }
 
+// ---- Handlers ----
+bot.onText(/\/start|\/settings/, (msg) => sendSettingsPanel(msg.chat.id));
+
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const cfg = await getChat(chatId);
+  await bot.answerCallbackQuery(query.id);
+
+  if (query.data === 'set_decimals') {
+    awaitingDecimalsInput.set(chatId, query.message.message_id);
+    return bot.sendMessage(chatId, 'Reply with token address and decimals (e.g. `0x1234... 18`):');
+  }
+  if (query.data === 'add_token') {
+    awaitingTokenInput.set(chatId, query.message.message_id);
+    return bot.sendMessage(chatId, 'Reply with token address (0x...) to add:');
+  }
+  if (query.data === 'remove_token') {
+    if (!cfg.pools.length) return bot.sendMessage(chatId, 'No tokens to remove.');
+    const rows = cfg.pools.map(p => ([{ text: cfg.tokenSymbols[p] || p, callback_data: `rm:${p}` }]));
+    rows.push([{ text: '⬅️ Back', callback_data: 'back_to_settings' }]);
+    return bot.editMessageText('Select a token to remove:', {
+      chat_id: chatId,
+      message_id: query.message.message_id,
+      reply_markup: { inline_keyboard: rows }
+    });
+  }
+  if (query.data.startsWith('rm:')) {
+    const pool = query.data.slice(3);
+    cfg.pools = cfg.pools.filter(p => p !== pool);
+    delete cfg.tokenSymbols[pool];
+    await setChat(chatId, cfg);
+    return sendSettingsPanel(chatId, query.message.message_id);
+  }
+  if (query.data === 'toggle_sells') {
+    cfg.showSells = !cfg.showSells;
+    await setChat(chatId, cfg);
+    return sendSettingsPanel(chatId, query.message.message_id);
+  }
+  if (query.data === 'start_comp') {
+    compWizard.set(chatId, { step: 1, data: {} });
+    return bot.sendMessage(chatId, '🏆 Enter duration (minutes):');
+  }
+  if (query.data === 'show_leaderboard') return postLeaderboard(chatId);
+  if (query.data === 'end_comp') {
+    if (cfg.activeCompetition) {
+      await postLeaderboard(chatId, true);
+      cfg.activeCompetition = null;
+      await setChat(chatId, cfg);
+      return bot.sendMessage(chatId, '🛑 Competition ended.');
+    }
+    return bot.sendMessage(chatId, 'No active competition.');
+  }
+});
+
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+
+  if (awaitingDecimalsInput.has(chatId)) {
+    const msgId = awaitingDecimalsInput.get(chatId);
+    awaitingDecimalsInput.delete(chatId);
+    const [addr, dec] = msg.text.split(/\s+/);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(addr) || isNaN(Number(dec))) {
+      await bot.sendMessage(chatId, '❌ Format must be: 0xTOKENADDRESS DECIMALS');
+      return sendSettingsPanel(chatId, msgId);
+    }
+    const cfg = await getChat(chatId);
+    cfg.decimalsOverrides[addr.toLowerCase()] = Number(dec);
+    await setChat(chatId, cfg);
+    await bot.sendMessage(chatId, `✅ Decimals for ${addr} set to ${dec}`);
+    return sendSettingsPanel(chatId, msgId);
+  }
+
+  const wizard = compWizard.get(chatId);
+  if (wizard) {
+    const data = wizard.data;
+    if (wizard.step === 1) {
+      const minutes = Number(msg.text);
+      if (!minutes || minutes < 1) return bot.sendMessage(chatId, 'Enter a valid duration in minutes:');
+      data.duration = minutes;
+      wizard.step = 2;
+      return bot.sendMessage(chatId, 'Enter minimum buy USD to qualify:');
+    }
+    if (wizard.step === 2) {
+      data.minBuyUsd = Number(msg.text) || 0;
+      wizard.step = 3;
+      return bot.sendMessage(chatId, 'Enter prize for 🥇 1st place:');
+    }
+    if (wizard.step === 3) {
+      data.prize1 = msg.text;
+      wizard.step = 4;
+      return bot.sendMessage(chatId, 'Enter prizes for 🥈 2nd and 🥉 3rd (comma separated):');
+    }
+    if (wizard.step === 4) {
+      const [p2, p3] = msg.text.split(',').map(x => x.trim());
+      data.prizes = [data.prize1, p2, p3];
+      const cfg = await getChat(chatId);
+      cfg.activeCompetition = {
+        endsAt: Date.now() + data.duration * 60 * 1000,
+        minBuyUsd: data.minBuyUsd,
+        prizes: data.prizes,
+        leaderboard: {}
+      };
+      await setChat(chatId, cfg);
+      compWizard.delete(chatId);
+      await bot.sendMessage(chatId,
+        `🎉 Big Buy Competition Started!\n⏳ ${data.duration} min\n💵 Min Buy $${data.minBuyUsd}\n` +
+        `🥇 ${data.prizes[0]}\n🥈 ${data.prizes[1]}\n🥉 ${data.prizes[2]}`);
+      return sendSettingsPanel(chatId);
+    }
+  }
+});
+
 // ---- Leaderboard + Competition ----
 async function postLeaderboard(chatId, final = false) {
   const cfg = await getChat(chatId);
@@ -183,20 +295,22 @@ async function postLeaderboard(chatId, final = false) {
   if (final && cfg.activeCompetition.prizes?.length) {
     msg += `\n🏆 Prizes:\n🥇 ${cfg.activeCompetition.prizes[0] || '-'}\n🥈 ${cfg.activeCompetition.prizes[1] || '-'}\n🥉 ${cfg.activeCompetition.prizes[2] || '-'}`;
   }
-  try {
-    await bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
-  } catch (e) {
-    console.warn(`[Telegram] Leaderboard send failed:`, e.message);
-  }
+  await bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
 }
 
-async function updateLeaderboard(chatId, buyer, usd) {
-  const cfg = await getChat(chatId);
-  if (!cfg.activeCompetition) return;
-  if (usd < cfg.activeCompetition.minBuyUsd) return;
-  cfg.activeCompetition.leaderboard[buyer] = (cfg.activeCompetition.leaderboard[buyer] || 0) + usd;
-  await setChat(chatId, cfg);
-}
+// ---- Auto-End Checker ----
+setInterval(async () => {
+  const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
+  for (const k of keys) {
+    const chatId = Number(k.split(':')[1]);
+    const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
+    if (cfg?.activeCompetition && Date.now() >= cfg.activeCompetition.endsAt) {
+      await postLeaderboard(chatId, true);
+      cfg.activeCompetition = null;
+      await setChat(chatId, cfg);
+    }
+  }
+}, 30000);
 
 // ---- Broadcast + Buy Message ----
 async function broadcastTrade(pool, trade) {
@@ -209,7 +323,9 @@ async function broadcastTrade(pool, trade) {
 
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
-    if (cfg.activeCompetition) await updateLeaderboard(chatId, trade.buyer || trade.tx, usd);
+
+    if (cfg.activeCompetition) cfg.activeCompetition.leaderboard[trade.buyer || trade.tx] = 
+      (cfg.activeCompetition.leaderboard[trade.buyer || trade.tx] || 0) + usd;
 
     try {
       const tokenAddr = trade.toToken || trade.fromToken;
@@ -251,13 +367,9 @@ async function broadcastTrade(pool, trade) {
         extraData +
         (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
         `🔗 <a href="${EXPLORER_TX_URL + trade.tx}">TX</a>`;
-      try {
-        if (cfg.gifFileId) await bot.sendAnimation(chatId, cfg.gifFileId, { caption, parse_mode: 'HTML' });
-        else if (cfg.gifUrl) await bot.sendAnimation(chatId, cfg.gifUrl, { caption, parse_mode: 'HTML' });
-        else await bot.sendMessage(chatId, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
-      } catch (err) {
-        console.warn(`[Telegram] Failed to send to ${chatId}:`, err.message);
-      }
+      if (cfg.gifFileId) await bot.sendAnimation(chatId, cfg.gifFileId, { caption, parse_mode: 'HTML' });
+      else if (cfg.gifUrl) await bot.sendAnimation(chatId, cfg.gifUrl, { caption, parse_mode: 'HTML' });
+      else await bot.sendMessage(chatId, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
     } catch (e) {
       console.warn(`[DEBUG] Extra data fetch failed:`, e.message);
     }
