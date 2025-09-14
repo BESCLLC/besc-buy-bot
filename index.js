@@ -17,6 +17,7 @@ if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
+const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 }); // Moved queue declaration up
 
 const app = express();
 app.get('/healthz', (_, res) => res.send('ok'));
@@ -72,7 +73,7 @@ function tierEmoji(cfg, usd) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function formatUSD(n, maxFraction = 0) {
@@ -415,6 +416,7 @@ async function broadcastTrade(pool, trade) {
     }
 
     let extraData = '';
+    let price = Number(trade.priceUsd || 0);
     try {
       const tokenAddr = trade.toToken || trade.fromToken;
       if (tokenAddr) {
@@ -427,7 +429,7 @@ async function broadcastTrade(pool, trade) {
         const tokenAttr = tokenRes?.data?.data?.attributes || {};
         const poolAttr = poolRes?.data?.data?.attributes || {};
         const decimals = cfg.decimalsOverrides[tokenAddr.toLowerCase()] ?? tokenAttr.decimals ?? 18;
-        const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
+        price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
 
         let mcLabel = 'MC';
         let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
@@ -455,7 +457,7 @@ async function broadcastTrade(pool, trade) {
     const caption =
       `${emoji} <b>${isSell ? 'SELL' : 'BUY'}</b> • <b>${escapeHtml(cfg.tokenSymbols[pool] || 'TOKEN')}</b>\n` +
       `💵 <b>$${usd.toFixed(2)}</b>\n` +
-      `🧮 ${trade.amountToken?.toLocaleString(undefined,{maximumFractionDigits:6}) || '—'} @ ${price ? `$${price.toFixed(6)}` : '—'}\n` +
+      `🧮 ${trade.amountToken?.toLocaleString(undefined, {maximumFractionDigits: 6}) || '—'} @ ${price ? `$${price.toFixed(6)}` : '—'}\n` +
       extraData +
       (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
       `🔗 <a href="${EXPLORER_TX_URL + trade.tx}">TX</a>`;
