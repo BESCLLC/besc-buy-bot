@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express from 'express';
 import TelegramBot from 'node-telegram-bot-api';
@@ -27,7 +26,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Health server on :' + PORT));
 
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
-const CG_BASE = 'https://pro-api.coingecko.com/api/v3/onchain';
 
 const memoryStore = new Map();
 
@@ -38,7 +36,8 @@ function defaultChatConfig() {
     gifUrl: null,
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
-    tokenSymbols: {}
+    tokenSymbols: {},
+    showSells: false // 👈 default: HIDE sells
   };
 }
 
@@ -107,8 +106,7 @@ function normalizeTrades(items) {
       amountToken: tokenAmount,
       tradeType: kind, // buy | sell
       buyer: a.tx_from_address || null,
-      ts: a.block_timestamp,
-      needsPrice: false
+      ts: a.block_timestamp
     };
   });
 }
@@ -187,6 +185,16 @@ bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`);
 });
 
+// NEW: toggle sell alerts
+bot.onText(/\/showsells (on|off)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const value = match[1].toLowerCase() === 'on';
+  const cfg = await getChat(chatId);
+  cfg.showSells = value;
+  await setChat(chatId, cfg);
+  bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`);
+});
+
 const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
 let poolRoundRobin = [];
 
@@ -218,6 +226,11 @@ async function broadcastTrade(pool, trade) {
     const chatId = Number(k.split(':')[1]);
     const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
     if (!cfg.pools.includes(pool)) continue;
+
+    if (trade.tradeType === 'sell' && cfg.showSells === false) {
+      console.log(`[DEBUG] Skipping sell alert for chat ${chatId}`);
+      continue;
+    }
 
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
