@@ -10,9 +10,7 @@ const {
   GECKO_NETWORK = 'besc-hyperchain',
   EXPLORER_TX_URL = 'https://explorer.beschyperchain.com/tx/',
   REDIS_URL,
-  POLL_INTERVAL_MS = '2000',
-  USE_COINGECKO_ONCHAIN = 'false',
-  COINGECKO_API_KEY
+  POLL_INTERVAL_MS = '2000'
 } = process.env;
 
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
@@ -26,7 +24,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Health server on :' + PORT));
 
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
-
 const memoryStore = new Map();
 
 function defaultChatConfig() {
@@ -37,7 +34,7 @@ function defaultChatConfig() {
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
     tokenSymbols: {},
-    showSells: false // 👈 default: HIDE sells
+    showSells: false // hide sells by default
   };
 }
 
@@ -91,7 +88,7 @@ async function fetchTradesForPool(pool) {
   }
 }
 
-// ✅ Correct schema mapping
+// Map trades using GeckoTerminal schema
 function normalizeTrades(items) {
   return (items || []).map(x => {
     const a = x.attributes || {};
@@ -104,8 +101,10 @@ function normalizeTrades(items) {
       priceUsd: Number(a.price_to_in_usd ?? a.price_from_in_usd ?? 0),
       amountUsd: Number(a.volume_in_usd ?? 0),
       amountToken: tokenAmount,
-      tradeType: kind, // buy | sell
+      tradeType: kind,
       buyer: a.tx_from_address || null,
+      fromToken: a.from_token_address,
+      toToken: a.to_token_address,
       ts: a.block_timestamp
     };
   });
@@ -185,7 +184,6 @@ bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`);
 });
 
-// NEW: toggle sell alerts
 bot.onText(/\/showsells (on|off)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const value = match[1].toLowerCase() === 'on';
@@ -226,47 +224,72 @@ async function broadcastTrade(pool, trade) {
     const chatId = Number(k.split(':')[1]);
     const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
     if (!cfg.pools.includes(pool)) continue;
-
-    if (trade.tradeType === 'sell' && cfg.showSells === false) {
-      console.log(`[DEBUG] Skipping sell alert for chat ${chatId}`);
-      continue;
-    }
+    if (trade.tradeType === 'sell' && cfg.showSells === false) continue;
 
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
+
+    // 🔎 Fetch token + pool info for MC/Liquidity/Volume/Change
+    let extraData = '';
+    try {
+      const tokenAddr = trade.toToken || trade.fromToken;
+      const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
+      const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
+      const [tokenRes, poolRes] = await Promise.all([
+        axios.get(tokenUrl, { headers: { 'Accept': 'application/json;version=20230302' } }),
+        axios.get(poolUrl, { headers: { 'Accept': 'application/json;version=20230302' } })
+      ]);
+
+      const tokenAttr = tokenRes?.data?.data?.attributes || {};
+      const poolAttr = poolRes?.data?.data?.attributes || {};
+      const supply = Number(tokenAttr.total_supply ?? 0);
+      const price = trade.priceUsd || 0;
+      if (supply > 0 && price > 0) {
+        const mc = supply * price;
+        extraData += `📊 MC: $${mc.toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
+      }
+      if (poolAttr.reserve_in_usd) {
+        extraData += `💧 Liquidity: $${Number(poolAttr.reserve_in_usd).toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
+      }
+      if (poolAttr.volume_usd_24h) {
+        extraData += `📈 24h Vol: $${Number(poolAttr.volume_usd_24h).toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
+      }
+      if (tokenAttr.price_percent_change_24h) {
+        const pct = Number(tokenAttr.price_percent_change_24h);
+        extraData += `📊 24h Change: ${pct>0?`+${pct.toFixed(2)}`:pct.toFixed(2)}%\n`;
+      }
+    } catch (e) {
+      console.warn(`[DEBUG] Extra data fetch failed:`, e.message);
+    }
 
     const isSell = trade.tradeType === 'sell';
     const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
     const action = isSell ? 'SELL' : 'BUY';
 
     const symbol = cfg.tokenSymbols[pool] || 'TOKEN';
-    const price = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
+    const priceStr = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
     const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
     const txUrl = EXPLORER_TX_URL + trade.tx;
     const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${pool}`;
 
     const caption = `${emoji} <b>${action}</b> • <b>${escapeHtml(symbol)}</b>\n` +
       `💵 <b>$${usd.toFixed(2)}</b>\n` +
-      `🧮 ${amountTok} ${escapeHtml(symbol)} @ ${price}\n` +
+      `🧮 ${amountTok} ${escapeHtml(symbol)} @ ${priceStr}\n` +
+      extraData +
       (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
       `🔗 <a href="${txUrl}">TX</a>`;
 
     const markup = {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
-      reply_markup: {
-        inline_keyboard: [[
-          { text: '📈 Chart', url: chart },
-          { text: '🔎 TX', url: txUrl }
-        ]]
-      }
+      reply_markup: { inline_keyboard: [[
+        { text: '📈 Chart', url: chart },
+        { text: '🔎 TX', url: txUrl }
+      ]] }
     };
 
-    if (cfg.gifUrl) {
-      await bot.sendAnimation(chatId, cfg.gifUrl, { caption, ...markup });
-    } else {
-      await bot.sendMessage(chatId, caption, markup);
-    }
+    if (cfg.gifUrl) await bot.sendAnimation(chatId, cfg.gifUrl, { caption, ...markup });
+    else await bot.sendMessage(chatId, caption, markup);
   }
 }
 
@@ -279,7 +302,6 @@ async function tickOnce() {
   if (!trades.length) return;
 
   console.log(`[DEBUG] Pool ${pool} returned ${trades.length} trades, latest USD: $${trades[0].amountUsd}`);
-
   const latest = trades[0];
   if (latest?.id && await seen(pool, latest.id)) return;
   if (latest?.id) await broadcastTrade(pool, latest);
