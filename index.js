@@ -178,6 +178,19 @@ bot.on('callback_query', async (query) => {
   const cfg = await getChat(chatId);
   await bot.answerCallbackQuery(query.id);
 
+  if (query.data === 'show_status') {
+    const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
+    const statusText =
+      `<b>Current Config</b>\n` +
+      `Pools:\n${pools}\n\n` +
+      `Min Buy: $${cfg.minBuyUsd}\n` +
+      `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
+      `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
+      `GIF: ${cfg.gifFileId ? '✅ custom set' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
+      `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
+    return bot.sendMessage(chatId, statusText, { parse_mode: 'HTML' });
+  }
+
   if (query.data === 'set_decimals') {
     awaitingDecimalsInput.set(chatId, query.message.message_id);
     return bot.sendMessage(chatId, 'Reply with token address and decimals (e.g. `0x1234... 18`):');
@@ -224,6 +237,7 @@ bot.on('callback_query', async (query) => {
   }
 });
 
+// ---- Message handlers ----
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
 
