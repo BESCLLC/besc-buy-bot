@@ -88,7 +88,6 @@ async function fetchTradesForPool(pool) {
   }
 }
 
-// Map trades using GeckoTerminal schema
 function normalizeTrades(items) {
   return (items || []).map(x => {
     const a = x.attributes || {};
@@ -229,7 +228,6 @@ async function broadcastTrade(pool, trade) {
     const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
 
-    // 🔎 Fetch token + pool info for MC/Liquidity/Volume/Change
     let extraData = '';
     try {
       const tokenAddr = trade.toToken || trade.fromToken;
@@ -242,11 +240,17 @@ async function broadcastTrade(pool, trade) {
 
       const tokenAttr = tokenRes?.data?.data?.attributes || {};
       const poolAttr = poolRes?.data?.data?.attributes || {};
-      const supply = Number(tokenAttr.total_supply ?? 0);
+      const supplyRaw = Number(tokenAttr.total_supply ?? 0);
+      const decimals = Number(tokenAttr.decimals ?? 18);
       const price = trade.priceUsd || 0;
-      if (supply > 0 && price > 0) {
-        const mc = supply * price;
+
+      if (supplyRaw > 0 && price > 0) {
+        const circulatingSupply = supplyRaw / (10 ** decimals);
+        const mc = circulatingSupply * price;
         extraData += `📊 MC: $${mc.toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
+      }
+      if (tokenAttr.fdv_usd) {
+        extraData += `🏷 FDV: $${Number(tokenAttr.fdv_usd).toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
       }
       if (poolAttr.reserve_in_usd) {
         extraData += `💧 Liquidity: $${Number(poolAttr.reserve_in_usd).toLocaleString(undefined,{maximumFractionDigits:0})}\n`;
