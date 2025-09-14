@@ -168,7 +168,8 @@ async function sendSettingsPanel(chatId, messageId = null) {
        { text: '🐋 Whale Tier', callback_data: 'tier_menu' }],
       [{ text: cfg.showSells ? '🔴 Hide Sells' : '🟢 Show Sells', callback_data: 'toggle_sells' }],
       [{ text: '🎞 Set GIF', callback_data: 'set_gif' }],
-      [{ text: '📊 Status', callback_data: 'show_status' }]
+      [{ text: '📊 Status', callback_data: 'show_status' }],
+      [{ text: '✅ Done', callback_data: 'done_settings' }]
     ]
   };
 
@@ -209,6 +210,12 @@ bot.on('callback_query', async (query) => {
       awaitingRemoveChoice.set(chatId, query.message.message_id);
       break;
     }
+
+    case 'done_settings':
+      await bot.answerCallbackQuery(query.id);
+      await bot.deleteMessage(chatId, query.message.message_id);
+      await bot.sendMessage(chatId, '✅ Settings updated.');
+      break;
 
     default:
       break;
@@ -319,7 +326,9 @@ bot.on('message', async (msg) => {
     if (top) {
       const cfg = await getChat(chatId);
       if (!cfg.pools.includes(top.pool)) cfg.pools.push(top.pool);
-      cfg.tokenSymbols[top.pool] = top.symbol || 'TOKEN';
+      cfg.tokenSymbols[top.pool
+
+] = top.symbol || 'TOKEN';
       await setChat(chatId, cfg);
       await bot.sendMessage(chatId, `✅ Tracking ${top.symbol} (${top.pool.slice(0,6)}…${top.pool.slice(-4)})`);
       await sendSettingsPanel(chatId, msgId);
