@@ -323,8 +323,13 @@ bot.on('callback_query', async (query) => {
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
 
-  if (msg.animation) {
-    if (!pendingGif.get(chatId)) return;
+  // Ignore messages that are commands (handled by bot.onText)
+  if (msg.text && msg.text.startsWith('/')) {
+    return; // Commands are handled by specific bot.onText handlers
+  }
+
+  // Handle GIF animations only if explicitly awaiting a GIF
+  if (msg.animation && pendingGif.has(chatId)) {
     const cfg = await getChat(chatId);
     cfg.gifFileId = msg.animation.file_id;
     cfg.gifUrl = null;
@@ -334,7 +339,8 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  if (!msg.text) return;
+  // Handle text input only if part of an active configuration flow
+  if (!msg.text) return; // Ignore non-text messages unless explicitly handled
 
   if (awaitingTokenInput.has(chatId)) {
     const token = msg.text.trim();
@@ -395,8 +401,8 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  const wizard = compWizard.get(chatId);
-  if (wizard) {
+  if (compWizard.has(chatId)) {
+    const wizard = compWizard.get(chatId);
     const data = wizard.data;
     if (wizard.step === 1) {
       const minutes = Number(msg.text);
@@ -434,6 +440,8 @@ bot.on('message', async (msg) => {
       return;
     }
   }
+
+  // Ignore all other messages to prevent unintended responses
 });
 
 // -------- Backward-compatible commands --------
