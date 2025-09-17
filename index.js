@@ -110,8 +110,9 @@ async function fetchTopPoolForToken(tokenAddr) {
     });
     const pools = data?.data?.relationships?.top_pools?.data || [];
     if (!pools.length) return null;
-    const poolId = pools[0].id;
-    const pool = poolId.split('_').pop();
+
+    // KEEP FULL POOL ID (with network prefix) to avoid collisions
+    const pool = pools[0].id;
     const symbol = data?.data?.attributes?.symbol || 'TOKEN';
     return { pool, symbol };
   } catch (e) {
@@ -122,6 +123,7 @@ async function fetchTopPoolForToken(tokenAddr) {
 
 async function fetchTradesForPool(pool) {
   try {
+    // pool already includes network prefix
     const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
     const { data } = await axios.get(url, {
       headers: { 'Accept': 'application/json;version=20230302' }
@@ -150,7 +152,7 @@ function normalizeTrades(items) {
       fromToken: a.from_token_address,
       toToken: a.to_token_address,
       ts: a.block_timestamp
-    };
+    }
   });
 }
 
