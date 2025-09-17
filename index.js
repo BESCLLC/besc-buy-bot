@@ -190,7 +190,8 @@ async function sendSettingsPanel(chatId, messageId = null) {
       [{ text: '🏆 Start Competition', callback_data: 'start_comp' },
        { text: '📊 Leaderboard', callback_data: 'show_leaderboard' },
        { text: '🛑 End Competition', callback_data: 'end_comp' }],
-      [{ text: '📊 Status', callback_data: 'show_status' }],
+      [{ text: '📊 Status', callback_data: 'show_status' },
+       { text: '🔄 Reset Thread', callback_data: 'reset_thread' }], // Added button
       [{ text: '✅ Done', callback_data: 'done_settings' }]
     ]
   };
@@ -218,7 +219,7 @@ async function sendSettingsPanel(chatId, messageId = null) {
         console.warn(`[WARN] Could not delete message ${messageId}:`, deleteErr.message);
       }
       if (error.message.includes("message thread not found")) {
-        cfg.threadId = null; // Clear invalid threadId
+        cfg.threadId = null;
         await setChat(chatId, cfg);
         await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
       }
@@ -234,8 +235,18 @@ bot.onText(/\/settings|\/start/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   if (msg.message_thread_id) {
-    cfg.threadId = msg.message_thread_id;
-    await setChat(chatId, cfg);
+    // Validate threadId before saving
+    try {
+      await bot.sendMessage(chatId, 'Validating topic...', { message_thread_id: msg.message_thread_id });
+      cfg.threadId = msg.message_thread_id;
+      await setChat(chatId, cfg);
+      await bot.deleteMessage(chatId, (await bot.getUpdates({ limit: 1 }))[0].message.message_id);
+    } catch (error) {
+      console.warn(`[WARN] Invalid thread ID ${msg.message_thread_id} for chat ${chatId}:`, error.message);
+      cfg.threadId = null;
+      await setChat(chatId, cfg);
+      await bot.sendMessage(chatId, '⚠️ Invalid topic. Please run /settings in a valid topic.', {});
+    }
   }
   await sendSettingsPanel(chatId);
 });
@@ -247,6 +258,15 @@ bot.onText(/\/resetchat/, async (msg) => {
   await redis?.del(`chat:${chatId}:config`);
   memoryStore.delete(chatId);
   await bot.sendMessage(chatId, '✅ Chat configuration reset. Use /settings to re-add pools.', { ...opts });
+});
+
+bot.onText(/\/resetthread/, async (msg) => {
+  const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  cfg.threadId = null;
+  await setChat(chatId, cfg);
+  await bot.sendMessage(chatId, '✅ Topic thread ID cleared. Run /settings in a valid topic to set a new one.', { ...opts });
 });
 
 bot.onText(/\/resetpool (.+)/, async (msg, match) => {
@@ -411,6 +431,14 @@ bot.on('callback_query', async (query) => {
       cfg.gifChatId = null;
       await setChat(chatId, cfg);
       await bot.answerCallbackQuery(query.id, { text: 'GIF removed.' });
+      await sendSettingsPanel(chatId, query.message.message_id);
+      break;
+
+    case 'reset_thread':
+      cfg.threadId = null;
+      await setChat(chatId, cfg);
+      await bot.answerCallbackQuery(query.id, { text: 'Thread ID cleared.' });
+      await bot.sendMessage(chatId, '✅ Topic thread ID cleared. Run /settings in a valid topic to set a new one.', {});
       await sendSettingsPanel(chatId, query.message.message_id);
       break;
 
