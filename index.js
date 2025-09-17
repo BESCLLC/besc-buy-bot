@@ -210,17 +210,21 @@ async function sendSettingsPanel(chatId, messageId = null) {
       await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
     }
   } catch (error) {
-    if (error.message.includes("message can't be edited")) {
-      console.warn(`[WARN] Could not edit message ${messageId} in chat ${chatId} (likely user-sent or invalid context). Sending new message.`);
+    if (error.message.includes("message can't be edited") || error.message.includes("message thread not found")) {
+      console.warn(`[WARN] Could not edit/send settings panel for chat ${chatId} (invalid message or thread). Sending new message.`);
       try {
         if (messageId) await bot.deleteMessage(chatId, messageId, { ...opts });
       } catch (deleteErr) {
         console.warn(`[WARN] Could not delete message ${messageId}:`, deleteErr.message);
       }
-      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
+      if (error.message.includes("message thread not found")) {
+        cfg.threadId = null; // Clear invalid threadId
+        await setChat(chatId, cfg);
+        await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
+      }
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
     } else {
       console.error(`[ERROR] Failed to send/edit settings panel for chat ${chatId}:`, error.message);
-      throw error;
     }
   }
 }
@@ -293,20 +297,23 @@ bot.on('callback_query', async (query) => {
           ...opts
         });
       } catch (error) {
-        if (error.message.includes("message can't be edited")) {
+        if (error.message.includes("message can't be edited") || error.message.includes("message thread not found")) {
           console.warn(`[WARN] Could not edit remove_token message in chat ${chatId}. Sending new message.`);
           try {
             await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
           } catch (deleteErr) {
             console.warn(`[WARN] Could not delete message ${query.message.message_id}:`, deleteErr.message);
           }
+          if (error.message.includes("message thread not found")) {
+            cfg.threadId = null;
+            await setChat(chatId, cfg);
+            await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
+          }
           await bot.sendMessage(chatId, 'Select a token to remove:', {
-            reply_markup: { inline_keyboard: rows },
-            ...opts
+            reply_markup: { inline_keyboard: rows }
           });
         } else {
           console.error(`[ERROR] Failed to edit remove_token message for chat ${chatId}:`, error.message);
-          throw error;
         }
       }
       awaitingRemoveChoice.set(chatId, query.message.message_id);
@@ -345,12 +352,17 @@ bot.on('callback_query', async (query) => {
           }
         );
       } catch (error) {
-        if (error.message.includes("message can't be edited")) {
+        if (error.message.includes("message can't be edited") || error.message.includes("message thread not found")) {
           console.warn(`[WARN] Could not edit tier_menu message in chat ${chatId}. Sending new message.`);
           try {
             await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
           } catch (deleteErr) {
             console.warn(`[WARN] Could not delete message ${query.message.message_id}:`, deleteErr.message);
+          }
+          if (error.message.includes("message thread not found")) {
+            cfg.threadId = null;
+            await setChat(chatId, cfg);
+            await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
           }
           await bot.sendMessage(chatId, 
             `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
@@ -362,13 +374,11 @@ bot.on('callback_query', async (query) => {
                    { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
                   [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
                 ]
-              },
-              ...opts
+              }
             }
           );
         } else {
           console.error(`[ERROR] Failed to edit tier_menu message for chat ${chatId}:`, error.message);
-          throw error;
         }
       }
       break;
@@ -779,15 +789,23 @@ async function safeSend(chatId, sendFn) {
       if (redis) await redis.del(`chat:${chatId}:config`);
       else memoryStore.delete(chatId);
       try {
-        await bot.sendMessage(chatId, '⚠️ This chat was upgraded to a supergroup or the bot was removed. Please run /settings to reconfigure.', { ...opts });
+        await bot.sendMessage(chatId, '⚠️ Chat was upgraded to a supergroup or the bot was removed. Please run /settings to reconfigure.', {});
       } catch (notifyErr) {
         console.warn(`[WARN] Could not notify chat ${chatId} about upgrade:`, notifyErr.message);
       }
-    } else if (desc.includes('file_id') || desc.includes('not found')) {
-      console.warn(`[WARN] Invalid GIF file_id for chat ${chatId}, falling back to text or URL-based GIF`);
+    } else if (desc.includes('file_id') || desc.includes('not found') || desc.includes('message thread not found')) {
+      console.warn(`[WARN] Invalid operation for chat ${chatId} (GIF file_id or thread not found). Falling back.`);
       const cfg = await getChat(chatId);
-      const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
-      await sendFn(opts);
+      if (desc.includes('message thread not found')) {
+        cfg.threadId = null;
+        await setChat(chatId, cfg);
+        try {
+          await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
+        } catch (notifyErr) {
+          console.warn(`[WARN] Could not notify chat ${chatId} about invalid topic:`, notifyErr.message);
+        }
+      }
+      await sendFn({});
     } else {
       console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message, desc);
     }
