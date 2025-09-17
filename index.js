@@ -622,14 +622,24 @@ async function safeSend(chatId, sendFn) {
   try {
     await sendFn();
   } catch (e) {
-    if (e.response?.body?.description?.includes('kicked') ||
-        e.response?.body?.description?.includes('forbidden')) {
+    const desc = e.response?.body?.description || '';
+    if (desc.includes('kicked') || desc.includes('forbidden')) {
       console.log(`[INFO] Bot removed from chat ${chatId}, cleaning config`);
       if (redis) await redis.del(`chat:${chatId}:config`);
       else memoryStore.delete(chatId);
+    } else if (desc.includes('file_id') || desc.includes('not found')) {
+      console.warn(`[WARN] Invalid GIF for chat ${chatId}, falling back to text alert`);
+      // auto-remove broken gif so future alerts don't fail
+      const cfg = await getChat(chatId);
+      cfg.gifFileId = null;
+      cfg.gifUrl = null;
+      await setChat(chatId, cfg);
+      // fallback plain message send
+      await bot.sendMessage(chatId, '⚠️ GIF failed to send, switched back to text alerts.', { parse_mode: 'HTML' });
     } else {
-      console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message);
+      console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message, desc);
     }
+  
   }
 }
 
