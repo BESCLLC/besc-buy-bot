@@ -42,6 +42,7 @@ function defaultChatConfig() {
     minBuyUsd: 0,
     gifUrl: null,
     gifFileId: null,
+    gifChatId: null, // Store the chat ID where the GIF was uploaded
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
     tokenSymbols: {},
@@ -111,7 +112,6 @@ async function fetchTopPoolForToken(tokenAddr) {
     const pools = data?.data?.relationships?.top_pools?.data || [];
     if (!pools.length) return null;
 
-    // KEEP FULL POOL ID (with network prefix) to avoid collisions
     const pool = pools[0].id;
     const symbol = data?.data?.attributes?.symbol || 'TOKEN';
     return { pool, symbol };
@@ -123,7 +123,6 @@ async function fetchTopPoolForToken(tokenAddr) {
 
 async function fetchTradesForPool(pool) {
   try {
-    // pool already includes network prefix
     const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
     const { data } = await axios.get(url, {
       headers: { 'Accept': 'application/json;version=20230302' }
@@ -178,7 +177,10 @@ async function sendSettingsPanel(chatId, messageId = null) {
       [{ text: '🎯 Min Buy', callback_data: 'set_minbuy' },
        { text: '🐋 Whale Tier', callback_data: 'tier_menu' }],
       [{ text: cfg.showSells ? '🔴 Hide Sells' : '🟢 Show Sells', callback_data: 'toggle_sells' }],
-      [{ text: '🎞 Set GIF', callback_data: 'set_gif' }],
+      [
+        { text: '🎞 Set GIF', callback_data: 'set_gif' },
+        { text: '🗑 Remove GIF', callback_data: 'remove_gif' } // New button to remove GIF
+      ],
       [{ text: '🏆 Start Competition', callback_data: 'start_comp' },
        { text: '📊 Leaderboard', callback_data: 'show_leaderboard' },
        { text: '🛑 End Competition', callback_data: 'end_comp' }],
@@ -196,6 +198,16 @@ async function sendSettingsPanel(chatId, messageId = null) {
 
 // -------- Handlers --------
 bot.onText(/\/settings|\/start/, (msg) => sendSettingsPanel(msg.chat.id));
+
+bot.onText(/\/removegif/, async (msg) => {
+  const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  cfg.gifFileId = null;
+  cfg.gifUrl = null;
+  cfg.gifChatId = null;
+  await setChat(chatId, cfg);
+  bot.sendMessage(chatId, '🗑 GIF removed. Alerts will use text only.');
+});
 
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
@@ -273,6 +285,15 @@ bot.on('callback_query', async (query) => {
       await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts (as an animation).');
       break;
 
+    case 'remove_gif':
+      cfg.gifFileId = null;
+      cfg.gifUrl = null;
+      cfg.gifChatId = null;
+      await setChat(chatId, cfg);
+      await bot.answerCallbackQuery(query.id, { text: 'GIF removed.' });
+      await sendSettingsPanel(chatId, query.message.message_id);
+      break;
+
     case 'show_status':
       await bot.sendMessage(chatId, 'Use /status to view full configuration.');
       break;
@@ -325,24 +346,22 @@ bot.on('callback_query', async (query) => {
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
 
-  // Ignore messages that are commands (handled by bot.onText)
   if (msg.text && msg.text.startsWith('/')) {
-    return; // Commands are handled by specific bot.onText handlers
+    return;
   }
 
-  // Handle GIF animations only if explicitly awaiting a GIF
   if (msg.animation && pendingGif.has(chatId)) {
     const cfg = await getChat(chatId);
     cfg.gifFileId = msg.animation.file_id;
     cfg.gifUrl = null;
+    cfg.gifChatId = chatId; // Store the chat ID where the GIF was uploaded
     await setChat(chatId, cfg);
     pendingGif.delete(chatId);
-    await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert.');
+    await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.');
     return;
   }
 
-  // Handle text input only if part of an active configuration flow
-  if (!msg.text) return; // Ignore non-text messages unless explicitly handled
+  if (!msg.text) return;
 
   if (awaitingTokenInput.has(chatId)) {
     const token = msg.text.trim();
@@ -442,8 +461,6 @@ bot.on('message', async (msg) => {
       return;
     }
   }
-
-  // Ignore all other messages to prevent unintended responses
 });
 
 // -------- Backward-compatible commands --------
@@ -498,6 +515,7 @@ bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
     const cfg = await getChat(chatId);
     cfg.gifUrl = match[1];
     cfg.gifFileId = null;
+    cfg.gifChatId = null;
     await setChat(chatId, cfg);
     bot.sendMessage(chatId, '✅ GIF URL set.');
   } else {
@@ -512,9 +530,10 @@ bot.on('animation', async (msg) => {
   const cfg = await getChat(chatId);
   cfg.gifFileId = msg.animation.file_id;
   cfg.gifUrl = null;
+  cfg.gifChatId = chatId;
   await setChat(chatId, cfg);
   pendingGif.delete(chatId);
-  bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert.');
+  bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.');
 });
 
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
@@ -556,7 +575,7 @@ bot.onText(/\/status/, async (msg) => {
     `Min Buy: $${cfg.minBuyUsd}\n` +
     `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
     `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
-    `GIF: ${cfg.gifFileId ? '✅ custom set' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
+    `GIF: ${cfg.gifFileId ? `✅ custom set (chat ${cfg.gifChatId})` : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
     `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
   bot.sendMessage(chatId, statusText, { parse_mode: 'HTML' });
 });
@@ -628,18 +647,12 @@ async function safeSend(chatId, sendFn) {
       if (redis) await redis.del(`chat:${chatId}:config`);
       else memoryStore.delete(chatId);
     } else if (desc.includes('file_id') || desc.includes('not found')) {
-      console.warn(`[WARN] Invalid GIF for chat ${chatId}, falling back to text alert`);
-      // auto-remove broken gif so future alerts don't fail
-      const cfg = await getChat(chatId);
-      cfg.gifFileId = null;
-      cfg.gifUrl = null;
-      await setChat(chatId, cfg);
-      // fallback plain message send
-      await bot.sendMessage(chatId, '⚠️ GIF failed to send, switched back to text alerts.', { parse_mode: 'HTML' });
+      console.warn(`[WARN] Invalid GIF file_id for chat ${chatId}, falling back to text or URL-based GIF`);
+      // Do not reset GIF config here; let user manually remove it if needed
+      await sendFn(true); // Retry with fallback
     } else {
       console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message, desc);
     }
-  
   }
 }
 
@@ -675,7 +688,6 @@ async function broadcastTrade(pool, trade) {
         const poolAttr = poolRes?.data?.data?.attributes || {};
         const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
 
-        // MC/FDV logic
         let mcLabel = 'MC';
         let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
         if (!mcValue && price > 0) {
@@ -725,8 +737,8 @@ async function broadcastTrade(pool, trade) {
       (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
       `🔗 <a href="${txUrl}">TX</a>`;
 
-    await safeSend(chatId, async () => {
-      if (cfg.gifFileId) {
+    await safeSend(chatId, async (fallback = false) => {
+      if (!fallback && cfg.gifFileId && cfg.gifChatId === chatId) {
         await bot.sendAnimation(chatId, cfg.gifFileId, {
           caption, parse_mode: 'HTML',
           reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
