@@ -43,7 +43,7 @@ function defaultChatConfig() {
     gifUrl: null,
     gifFileId: null,
     gifChatId: null,
-    threadId: null, // Store the Telegram topic ID
+    threadId: null,
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
     tokenSymbols: {},
@@ -191,10 +191,32 @@ async function sendSettingsPanel(chatId, messageId = null) {
   };
 
   const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
-  if (messageId) {
-    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: keyboard, ...opts });
-  } else {
-    return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
+
+  try {
+    if (messageId) {
+      await bot.editMessageText(text, { 
+        chat_id: chatId, 
+        message_id: messageId, 
+        parse_mode: 'HTML', 
+        reply_markup: keyboard, 
+        ...opts 
+      });
+    } else {
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
+    }
+  } catch (error) {
+    if (error.message.includes("message can't be edited")) {
+      console.warn(`[WARN] Could not edit message ${messageId} in chat ${chatId} (likely user-sent or invalid context). Sending new message.`);
+      try {
+        if (messageId) await bot.deleteMessage(chatId, messageId, { ...opts });
+      } catch (deleteErr) {
+        console.warn(`[WARN] Could not delete message ${messageId}:`, deleteErr.message);
+      }
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
+    } else {
+      console.error(`[ERROR] Failed to send/edit settings panel for chat ${chatId}:`, error.message);
+      throw error;
+    }
   }
 }
 
@@ -206,7 +228,7 @@ bot.onText(/\/settings|\/start/, async (msg) => {
     cfg.threadId = msg.message_thread_id;
     await setChat(chatId, cfg);
   }
-  sendSettingsPanel(chatId, msg.message_id);
+  await sendSettingsPanel(chatId); // Always send new message
 });
 
 bot.onText(/\/resetchat/, async (msg) => {
@@ -215,7 +237,7 @@ bot.onText(/\/resetchat/, async (msg) => {
   const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   await redis?.del(`chat:${chatId}:config`);
   memoryStore.delete(chatId);
-  bot.sendMessage(chatId, '✅ Chat configuration reset. Use /settings to re-add pools.', { ...opts });
+  await bot.sendMessage(chatId, '✅ Chat configuration reset. Use /settings to re-add pools.', { ...opts });
 });
 
 bot.onText(/\/resetpool (.+)/, async (msg, match) => {
@@ -225,7 +247,7 @@ bot.onText(/\/resetpool (.+)/, async (msg, match) => {
   const poolId = match[1].trim();
   await redis?.del(`pool:${poolId}:lastTradeId`);
   memoryStore.delete(`pool:${poolId}:lastTradeId`);
-  bot.sendMessage(chatId, `✅ Cleared lastTradeId for pool ${poolId}. Next trade will trigger.`, { ...opts });
+  await bot.sendMessage(chatId, `✅ Cleared lastTradeId for pool ${poolId}. Next trade will trigger.`, { ...opts });
 });
 
 bot.onText(/\/removegif/, async (msg) => {
@@ -236,7 +258,7 @@ bot.onText(/\/removegif/, async (msg) => {
   cfg.gifUrl = null;
   cfg.gifChatId = null;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, '🗑 GIF removed. Alerts will use text only.', { ...opts });
+  await bot.sendMessage(chatId, '🗑 GIF removed. Alerts will use text only.', { ...opts });
 });
 
 bot.on('callback_query', async (query) => {
@@ -258,17 +280,39 @@ bot.on('callback_query', async (query) => {
       }
       const rows = cfg.pools.map(p => ([{ text: (cfg.tokenSymbols[p] || p.slice(0,6)+'…'+p.slice(-4)), callback_data: `rm:${p}` }]));
       rows.push([{ text: '⬅️ Back', callback_data: 'back_to_settings' }]);
-      await bot.editMessageText('Select a token to remove:', {
-        chat_id: chatId,
-        message_id: query.message.message_id,
-        reply_markup: { inline_keyboard: rows },
-        ...opts
-      });
+      try {
+        await bot.editMessageText('Select a token to remove:', {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          reply_markup: { inline_keyboard: rows },
+          ...opts
+        });
+      } catch (error) {
+        if (error.message.includes("message can't be edited")) {
+          console.warn(`[WARN] Could not edit remove_token message in chat ${chatId}. Sending new message.`);
+          try {
+            await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
+          } catch (deleteErr) {
+            console.warn(`[WARN] Could not delete message ${query.message.message_id}:`, deleteErr.message);
+          }
+          await bot.sendMessage(chatId, 'Select a token to remove:', {
+            reply_markup: { inline_keyboard: rows },
+            ...opts
+          });
+        } else {
+          console.error(`[ERROR] Failed to edit remove_token message for chat ${chatId}:`, error.message);
+          throw error;
+        }
+      }
       awaitingRemoveChoice.set(chatId, query.message.message_id);
       break;
 
     case 'done_settings':
-      await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
+      try {
+        await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
+      } catch (deleteErr) {
+        console.warn(`[WARN] Could not delete settings message ${query.message.message_id}:`, deleteErr.message);
+      }
       await bot.sendMessage(chatId, '✅ Settings updated.', { ...opts });
       break;
 
@@ -278,22 +322,50 @@ bot.on('callback_query', async (query) => {
       break;
 
     case 'tier_menu':
-      await bot.editMessageText(
-        `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
-        {
-          chat_id: chatId,
-          message_id: query.message.message_id,
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: `Small: $${cfg.tiers.small}`, callback_data: 'set_tier_small' },
-               { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
-              [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
-            ]
-          },
-          ...opts
+      try {
+        await bot.editMessageText(
+          `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
+          {
+            chat_id: chatId,
+            message_id: query.message.message_id,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: `Small: $${cfg.tiers.small}`, callback_data: 'set_tier_small' },
+                 { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
+                [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
+              ]
+            },
+            ...opts
+          }
+        );
+      } catch (error) {
+        if (error.message.includes("message can't be edited")) {
+          console.warn(`[WARN] Could not edit tier_menu message in chat ${chatId}. Sending new message.`);
+          try {
+            await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
+          } catch (deleteErr) {
+            console.warn(`[WARN] Could not delete message ${query.message.message_id}:`, deleteErr.message);
+          }
+          await bot.sendMessage(chatId, 
+            `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
+            {
+              parse_mode: 'HTML',
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: `Small: $${cfg.tiers.small}`, callback_data: 'set_tier_small' },
+                   { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
+                  [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
+                ]
+              },
+              ...opts
+            }
+          );
+        } else {
+          console.error(`[ERROR] Failed to edit tier_menu message for chat ${chatId}:`, error.message);
+          throw error;
         }
-      );
+      }
       break;
 
     case 'set_tier_small':
@@ -509,7 +581,7 @@ bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   cfg.tokenSymbols[top.pool] = top.symbol || 'TOKEN';
   await setChat(chatId, cfg);
   const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${top.pool}`;
-  bot.sendMessage(chatId, `✅ Tracking <b>${escapeHtml(top.symbol)}</b>\nPool: <code>${top.pool}</code>`, {
+  await bot.sendMessage(chatId, `✅ Tracking <b>${escapeHtml(top.symbol)}</b>\nPool: <code>${top.pool}</code>`, {
     parse_mode: 'HTML',
     reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }]] },
     ...opts
@@ -526,7 +598,7 @@ bot.onText(/\/remove (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   cfg.pools = cfg.pools.filter(p => p !== top.pool);
   delete cfg.tokenSymbols[top.pool];
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `🛑 Stopped tracking pool ${top.pool}`, { ...opts });
+  await bot.sendMessage(chatId, `🛑 Stopped tracking pool ${top.pool}`, { ...opts });
 });
 
 bot.onText(/\/list/, async (msg) => {
@@ -535,7 +607,7 @@ bot.onText(/\/list/, async (msg) => {
   const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   if (!cfg.pools.length) return bot.sendMessage(chatId, 'No pools yet. Add with /add 0xYourToken or use /settings → Add Token', { ...opts });
   const lines = cfg.pools.map(p => `• <code>${p}</code> (${escapeHtml(cfg.tokenSymbols[p] || 'TOKEN')})`);
-  bot.sendMessage(chatId, `<b>Tracking:</b>\n${lines.join('\n')}`, { parse_mode: 'HTML', ...opts });
+  await bot.sendMessage(chatId, `<b>Tracking:</b>\n${lines.join('\n')}`, { parse_mode: 'HTML', ...opts });
 });
 
 bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
@@ -545,7 +617,7 @@ bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
   const min = Number(match[1]);
   cfg.minBuyUsd = min;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`, { ...opts });
+  await bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`, { ...opts });
 });
 
 bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
@@ -557,10 +629,10 @@ bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
     cfg.gifFileId = null;
     cfg.gifChatId = null;
     await setChat(chatId, cfg);
-    bot.sendMessage(chatId, '✅ GIF URL set.', { ...opts });
+    await bot.sendMessage(chatId, '✅ GIF URL set.', { ...opts });
   } else {
     pendingGif.set(chatId, true);
-    bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts.', { ...opts });
+    await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts.', { ...opts });
   }
 });
 
@@ -574,7 +646,7 @@ bot.on('animation', async (msg) => {
   cfg.gifChatId = chatId;
   await setChat(chatId, cfg);
   pendingGif.delete(chatId);
-  bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.', { ...opts });
+  await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.', { ...opts });
 });
 
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
@@ -585,7 +657,7 @@ bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   const value = match[2];
   cfg.emoji[which] = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`, { ...opts });
+  await bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`, { ...opts });
 });
 
 bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
@@ -596,7 +668,7 @@ bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
   const value = Number(match[2]);
   cfg.tiers[which] = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ ${which} buy threshold set to $${value}`, { ...opts });
+  await bot.sendMessage(chatId, `✅ ${which} buy threshold set to $${value}`, { ...opts });
 });
 
 bot.onText(/\/showsells (on|off)/, async (msg, match) => {
@@ -606,7 +678,7 @@ bot.onText(/\/showsells (on|off)/, async (msg, match) => {
   const value = match[1].toLowerCase() === 'on';
   cfg.showSells = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`, { ...opts });
+  await bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`, { ...opts });
 });
 
 bot.onText(/\/status/, async (msg) => {
@@ -623,23 +695,23 @@ bot.onText(/\/status/, async (msg) => {
     `GIF: ${cfg.gifFileId ? `✅ custom set (chat ${cfg.gifChatId})` : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
     `Thread ID: ${cfg.threadId ? cfg.threadId : 'None'}\n` +
     `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
-  bot.sendMessage(chatId, statusText, { parse_mode: 'HTML', ...opts });
+  await bot.sendMessage(chatId, statusText, { parse_mode: 'HTML', ...opts });
 });
 
 bot.onText(/\/ping/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
-  bot.sendMessage(chatId, '✅ Bot is online and running.', { ...opts });
+  await bot.sendMessage(chatId, '✅ Bot is online and running.', { ...opts });
 });
 
 // -------- Leaderboard + Competition --------
 async function postLeaderboard(chatId, final = false) {
   const cfg = await getChat(chatId);
   const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
-  if (!cfg.activeCompetition) return bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
+  if (!cfg.activeCompetition) return await bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
   const lb = Object.entries(cfg.activeCompetition.leaderboard || {}).sort((a,b) => b[1] - a[1]);
-  if (!lb.length) return bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
+  if (!lb.length) return await bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
   let msg = final ? '🎉 <b>Big Buy Competition Over!</b>\n\n' : '📊 <b>Current Leaderboard</b>\n\n';
   lb.slice(0, 10).forEach(([wallet, amount], i) => {
     msg += `${['🥇','🥈','🥉'][i] || (i+1)+'.'} ${wallet.slice(0,6)}…${wallet.slice(-4)} — $${amount.toFixed(2)}\n`;
@@ -704,7 +776,7 @@ async function safeSend(chatId, sendFn) {
       console.warn(`[WARN] Invalid GIF file_id for chat ${chatId}, falling back to text or URL-based GIF`);
       const cfg = await getChat(chatId);
       const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
-      await sendFn(opts); // Retry with same opts
+      await sendFn(opts);
     } else {
       console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message, desc);
     }
