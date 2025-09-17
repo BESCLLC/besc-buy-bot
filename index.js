@@ -42,7 +42,8 @@ function defaultChatConfig() {
     minBuyUsd: 0,
     gifUrl: null,
     gifFileId: null,
-    gifChatId: null, // Store the chat ID where the GIF was uploaded
+    gifChatId: null,
+    threadId: null, // Store the Telegram topic ID
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
     tokenSymbols: {},
@@ -189,54 +190,70 @@ async function sendSettingsPanel(chatId, messageId = null) {
     ]
   };
 
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   if (messageId) {
-    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: keyboard });
+    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: keyboard, ...opts });
   } else {
-    return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
+    return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
   }
 }
 
 // -------- Handlers --------
-bot.onText(/\/settings|\/start/, (msg) => sendSettingsPanel(msg.chat.id));
+bot.onText(/\/settings|\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  if (msg.message_thread_id) {
+    cfg.threadId = msg.message_thread_id;
+    await setChat(chatId, cfg);
+  }
+  sendSettingsPanel(chatId, msg.message_id);
+});
 
 bot.onText(/\/resetchat/, async (msg) => {
   const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   await redis?.del(`chat:${chatId}:config`);
   memoryStore.delete(chatId);
-  bot.sendMessage(chatId, '✅ Chat configuration reset. Use /settings to re-add pools.');
+  bot.sendMessage(chatId, '✅ Chat configuration reset. Use /settings to re-add pools.', { ...opts });
 });
 
 bot.onText(/\/resetpool (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   const poolId = match[1].trim();
   await redis?.del(`pool:${poolId}:lastTradeId`);
   memoryStore.delete(`pool:${poolId}:lastTradeId`);
-  bot.sendMessage(msg.chat.id, `✅ Cleared lastTradeId for pool ${poolId}. Next trade will trigger.`);
+  bot.sendMessage(chatId, `✅ Cleared lastTradeId for pool ${poolId}. Next trade will trigger.`, { ...opts });
 });
 
 bot.onText(/\/removegif/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   cfg.gifFileId = null;
   cfg.gifUrl = null;
   cfg.gifChatId = null;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, '🗑 GIF removed. Alerts will use text only.');
+  bot.sendMessage(chatId, '🗑 GIF removed. Alerts will use text only.', { ...opts });
 });
 
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   await bot.answerCallbackQuery(query.id);
 
   switch (query.data) {
     case 'add_token':
       awaitingTokenInput.set(chatId, query.message.message_id);
-      await bot.sendMessage(chatId, 'Reply with token address (0x...) to add:');
+      await bot.sendMessage(chatId, 'Reply with token address (0x...) to add:', { ...opts });
       break;
 
     case 'remove_token':
       if (!cfg.pools.length) {
-        await bot.sendMessage(chatId, 'No tokens to remove.');
+        await bot.sendMessage(chatId, 'No tokens to remove.', { ...opts });
         return;
       }
       const rows = cfg.pools.map(p => ([{ text: (cfg.tokenSymbols[p] || p.slice(0,6)+'…'+p.slice(-4)), callback_data: `rm:${p}` }]));
@@ -244,19 +261,20 @@ bot.on('callback_query', async (query) => {
       await bot.editMessageText('Select a token to remove:', {
         chat_id: chatId,
         message_id: query.message.message_id,
-        reply_markup: { inline_keyboard: rows }
+        reply_markup: { inline_keyboard: rows },
+        ...opts
       });
       awaitingRemoveChoice.set(chatId, query.message.message_id);
       break;
 
     case 'done_settings':
-      await bot.deleteMessage(chatId, query.message.message_id);
-      await bot.sendMessage(chatId, '✅ Settings updated.');
+      await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
+      await bot.sendMessage(chatId, '✅ Settings updated.', { ...opts });
       break;
 
     case 'set_minbuy':
       awaitingMinBuyInput.set(chatId, query.message.message_id);
-      await bot.sendMessage(chatId, 'Reply with minimum buy USD value (e.g. 50):');
+      await bot.sendMessage(chatId, 'Reply with minimum buy USD value (e.g. 50):', { ...opts });
       break;
 
     case 'tier_menu':
@@ -272,19 +290,20 @@ bot.on('callback_query', async (query) => {
                { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
               [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
             ]
-          }
+          },
+          ...opts
         }
       );
       break;
 
     case 'set_tier_small':
       awaitingTierInput.set(chatId, { which: 'small', msg: query.message.message_id });
-      await bot.sendMessage(chatId, 'Reply with new SMALL tier value (USD):');
+      await bot.sendMessage(chatId, 'Reply with new SMALL tier value (USD):', { ...opts });
       break;
 
     case 'set_tier_large':
       awaitingTierInput.set(chatId, { which: 'large', msg: query.message.message_id });
-      await bot.sendMessage(chatId, 'Reply with new LARGE tier value (USD):');
+      await bot.sendMessage(chatId, 'Reply with new LARGE tier value (USD):', { ...opts });
       break;
 
     case 'toggle_sells':
@@ -296,7 +315,7 @@ bot.on('callback_query', async (query) => {
 
     case 'set_gif':
       pendingGif.set(chatId, true);
-      await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts (as an animation).');
+      await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts (as an animation).', { ...opts });
       break;
 
     case 'remove_gif':
@@ -309,7 +328,7 @@ bot.on('callback_query', async (query) => {
       break;
 
     case 'show_status':
-      await bot.sendMessage(chatId, 'Use /status to view full configuration.');
+      await bot.sendMessage(chatId, 'Use /status to view full configuration.', { ...opts });
       break;
 
     case 'back_to_settings':
@@ -318,7 +337,7 @@ bot.on('callback_query', async (query) => {
 
     case 'start_comp':
       compWizard.set(chatId, { step: 1, data: {} });
-      await bot.sendMessage(chatId, '🏆 Enter duration (minutes):');
+      await bot.sendMessage(chatId, '🏆 Enter duration (minutes):', { ...opts });
       break;
 
     case 'show_leaderboard':
@@ -330,9 +349,9 @@ bot.on('callback_query', async (query) => {
         await postLeaderboard(chatId, true);
         cfg.activeCompetition = null;
         await setChat(chatId, cfg);
-        await bot.sendMessage(chatId, '🛑 Competition ended.');
+        await bot.sendMessage(chatId, '🛑 Competition ended.', { ...opts });
       } else {
-        await bot.sendMessage(chatId, 'No active competition.');
+        await bot.sendMessage(chatId, 'No active competition.', { ...opts });
       }
       break;
 
@@ -359,19 +378,20 @@ bot.on('callback_query', async (query) => {
 // -------- Message handlers --------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
 
   if (msg.text && msg.text.startsWith('/')) {
     return;
   }
 
   if (msg.animation && pendingGif.has(chatId)) {
-    const cfg = await getChat(chatId);
     cfg.gifFileId = msg.animation.file_id;
     cfg.gifUrl = null;
     cfg.gifChatId = chatId;
     await setChat(chatId, cfg);
     pendingGif.delete(chatId);
-    await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.');
+    await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.', { ...opts });
     return;
   }
 
@@ -383,7 +403,7 @@ bot.on('message', async (msg) => {
     const msgId = awaitingTokenInput.get(chatId);
     awaitingTokenInput.delete(chatId);
     if (!isAddr) {
-      await bot.sendMessage(chatId, '❌ Invalid address. Please send a valid 0x token address.');
+      await bot.sendMessage(chatId, '❌ Invalid address. Please send a valid 0x token address.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
       return;
     }
@@ -393,10 +413,10 @@ bot.on('message', async (msg) => {
       if (!cfg.pools.includes(top.pool)) cfg.pools.push(top.pool);
       cfg.tokenSymbols[top.pool] = top.symbol || 'TOKEN';
       await setChat(chatId, cfg);
-      await bot.sendMessage(chatId, `✅ Tracking ${top.symbol} (${top.pool.slice(0,6)}…${top.pool.slice(-4)})`);
+      await bot.sendMessage(chatId, `✅ Tracking ${top.symbol} (${top.pool.slice(0,6)}…${top.pool.slice(-4)})`, { ...opts });
       await sendSettingsPanel(chatId, msgId);
     } else {
-      await bot.sendMessage(chatId, '❌ No pool found for that token on this network.');
+      await bot.sendMessage(chatId, '❌ No pool found for that token on this network.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
     }
     return;
@@ -407,14 +427,14 @@ bot.on('message', async (msg) => {
     const msgId = awaitingMinBuyInput.get(chatId);
     awaitingMinBuyInput.delete(chatId);
     if (!Number.isFinite(val) || val < 0) {
-      await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.');
+      await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
       return;
     }
     const cfg = await getChat(chatId);
     cfg.minBuyUsd = val;
     await setChat(chatId, cfg);
-    await bot.sendMessage(chatId, `✅ Min buy set to $${val}`);
+    await bot.sendMessage(chatId, `✅ Min buy set to $${val}`, { ...opts });
     await sendSettingsPanel(chatId, msgId);
     return;
   }
@@ -424,14 +444,14 @@ bot.on('message', async (msg) => {
     awaitingTierInput.delete(chatId);
     const val = Number(msg.text);
     if (!Number.isFinite(val) || val < 0) {
-      await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.');
+      await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
       return;
     }
     const cfg = await getChat(chatId);
     cfg.tiers[which] = val;
     await setChat(chatId, cfg);
-    await bot.sendMessage(chatId, `✅ ${which.toUpperCase()} tier set to $${val}`);
+    await bot.sendMessage(chatId, `✅ ${which.toUpperCase()} tier set to $${val}`, { ...opts });
     await sendSettingsPanel(chatId, msgId);
     return;
   }
@@ -441,20 +461,20 @@ bot.on('message', async (msg) => {
     const data = wizard.data;
     if (wizard.step === 1) {
       const minutes = Number(msg.text);
-      if (!minutes || minutes < 1) return bot.sendMessage(chatId, 'Enter a valid duration in minutes:');
+      if (!minutes || minutes < 1) return bot.sendMessage(chatId, 'Enter a valid duration in minutes:', { ...opts });
       data.duration = minutes;
       wizard.step = 2;
-      return bot.sendMessage(chatId, 'Enter minimum buy USD to qualify:');
+      return bot.sendMessage(chatId, 'Enter minimum buy USD to qualify:', { ...opts });
     }
     if (wizard.step === 2) {
       data.minBuyUsd = Number(msg.text) || 0;
       wizard.step = 3;
-      return bot.sendMessage(chatId, 'Enter prize for 🥇 1st place:');
+      return bot.sendMessage(chatId, 'Enter prize for 🥇 1st place:', { ...opts });
     }
     if (wizard.step === 3) {
       data.prize1 = msg.text;
       wizard.step = 4;
-      return bot.sendMessage(chatId, 'Enter prizes for 🥈 2nd and 🥉 3rd (comma separated):');
+      return bot.sendMessage(chatId, 'Enter prizes for 🥈 2nd and 🥉 3rd (comma separated):', { ...opts });
     }
     if (wizard.step === 4) {
       const [p2, p3] = msg.text.split(',').map(x => x.trim());
@@ -470,7 +490,7 @@ bot.on('message', async (msg) => {
       compWizard.delete(chatId);
       await bot.sendMessage(chatId,
         `🎉 Big Buy Competition Started!\n⏳ ${data.duration} min\n💵 Min Buy $${data.minBuyUsd}\n` +
-        `🥇 ${data.prizes[0]}\n🥈 ${data.prizes[1]}\n🥉 ${data.prizes[2]}`);
+        `🥇 ${data.prizes[0]}\n🥈 ${data.prizes[1]}\n🥉 ${data.prizes[2]}`, { ...opts });
       await sendSettingsPanel(chatId);
       return;
     }
@@ -480,108 +500,119 @@ bot.on('message', async (msg) => {
 // -------- Backward-compatible commands --------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   const token = match[1];
   const top = await fetchTopPoolForToken(token);
-  if (!top) return bot.sendMessage(chatId, '❌ No pool found for that token on this network.');
-  const cfg = await getChat(chatId);
+  if (!top) return bot.sendMessage(chatId, '❌ No pool found for that token on this network.', { ...opts });
   if (!cfg.pools.includes(top.pool)) cfg.pools.push(top.pool);
   cfg.tokenSymbols[top.pool] = top.symbol || 'TOKEN';
   await setChat(chatId, cfg);
   const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${top.pool}`;
   bot.sendMessage(chatId, `✅ Tracking <b>${escapeHtml(top.symbol)}</b>\nPool: <code>${top.pool}</code>`, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }]] }
+    reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }]] },
+    ...opts
   });
 });
 
 bot.onText(/\/remove (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   const token = match[1];
   const top = await fetchTopPoolForToken(token);
-  if (!top) return bot.sendMessage(chatId, '❌ Could not resolve a pool for that token.');
-  const cfg = await getChat(chatId);
+  if (!top) return bot.sendMessage(chatId, '❌ Could not resolve a pool for that token.', { ...opts });
   cfg.pools = cfg.pools.filter(p => p !== top.pool);
   delete cfg.tokenSymbols[top.pool];
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `🛑 Stopped tracking pool ${top.pool}`);
+  bot.sendMessage(chatId, `🛑 Stopped tracking pool ${top.pool}`, { ...opts });
 });
 
 bot.onText(/\/list/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  if (!cfg.pools.length) return bot.sendMessage(chatId, 'No pools yet. Add with /add 0xYourToken or use /settings → Add Token');
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  if (!cfg.pools.length) return bot.sendMessage(chatId, 'No pools yet. Add with /add 0xYourToken or use /settings → Add Token', { ...opts });
   const lines = cfg.pools.map(p => `• <code>${p}</code> (${escapeHtml(cfg.tokenSymbols[p] || 'TOKEN')})`);
-  bot.sendMessage(chatId, `<b>Tracking:</b>\n${lines.join('\n')}`, { parse_mode: 'HTML' });
+  bot.sendMessage(chatId, `<b>Tracking:</b>\n${lines.join('\n')}`, { parse_mode: 'HTML', ...opts });
 });
 
 bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const min = Number(match[1]);
   const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const min = Number(match[1]);
   cfg.minBuyUsd = min;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`);
+  bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`, { ...opts });
 });
 
 bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   if (match[1]) {
-    const cfg = await getChat(chatId);
     cfg.gifUrl = match[1];
     cfg.gifFileId = null;
     cfg.gifChatId = null;
     await setChat(chatId, cfg);
-    bot.sendMessage(chatId, '✅ GIF URL set.');
+    bot.sendMessage(chatId, '✅ GIF URL set.', { ...opts });
   } else {
     pendingGif.set(chatId, true);
-    bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts.');
+    bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts.', { ...opts });
   }
 });
 
 bot.on('animation', async (msg) => {
   const chatId = msg.chat.id;
-  if (!pendingGif.get(chatId)) return;
   const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  if (!pendingGif.get(chatId)) return;
   cfg.gifFileId = msg.animation.file_id;
   cfg.gifUrl = null;
   cfg.gifChatId = chatId;
   await setChat(chatId, cfg);
   pendingGif.delete(chatId);
-  bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.');
+  bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.', { ...opts });
 });
 
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   const which = match[1];
   const value = match[2];
-  const cfg = await getChat(chatId);
   cfg.emoji[which] = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`);
+  bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`, { ...opts });
 });
 
 bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   const which = match[1];
   const value = Number(match[2]);
-  const cfg = await getChat(chatId);
   cfg.tiers[which] = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ ${which} buy threshold set to $${value}`);
+  bot.sendMessage(chatId, `✅ ${which} buy threshold set to $${value}`, { ...opts });
 });
 
 bot.onText(/\/showsells (on|off)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const value = match[1].toLowerCase() === 'on';
   const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const value = match[1].toLowerCase() === 'on';
   cfg.showSells = value;
   await setChat(chatId, cfg);
-  bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`);
+  bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`, { ...opts });
 });
 
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
   const statusText =
     `<b>Current Config</b>\n` +
@@ -590,18 +621,25 @@ bot.onText(/\/status/, async (msg) => {
     `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
     `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
     `GIF: ${cfg.gifFileId ? `✅ custom set (chat ${cfg.gifChatId})` : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
+    `Thread ID: ${cfg.threadId ? cfg.threadId : 'None'}\n` +
     `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
-  bot.sendMessage(chatId, statusText, { parse_mode: 'HTML' });
+  bot.sendMessage(chatId, statusText, { parse_mode: 'HTML', ...opts });
 });
 
-bot.onText(/\/ping/, (msg) => bot.sendMessage(msg.chat.id, '✅ Bot is online and running.'));
+bot.onText(/\/ping/, async (msg) => {
+  const chatId = msg.chat.id;
+  const cfg = await getChat(chatId);
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  bot.sendMessage(chatId, '✅ Bot is online and running.', { ...opts });
+});
 
 // -------- Leaderboard + Competition --------
 async function postLeaderboard(chatId, final = false) {
   const cfg = await getChat(chatId);
-  if (!cfg.activeCompetition) return;
+  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  if (!cfg.activeCompetition) return bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
   const lb = Object.entries(cfg.activeCompetition.leaderboard || {}).sort((a,b) => b[1] - a[1]);
-  if (!lb.length) return bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.');
+  if (!lb.length) return bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
   let msg = final ? '🎉 <b>Big Buy Competition Over!</b>\n\n' : '📊 <b>Current Leaderboard</b>\n\n';
   lb.slice(0, 10).forEach(([wallet, amount], i) => {
     msg += `${['🥇','🥈','🥉'][i] || (i+1)+'.'} ${wallet.slice(0,6)}…${wallet.slice(-4)} — $${amount.toFixed(2)}\n`;
@@ -609,7 +647,7 @@ async function postLeaderboard(chatId, final = false) {
   if (final && cfg.activeCompetition.prizes?.length) {
     msg += `\n🏆 Prizes:\n🥇 ${cfg.activeCompetition.prizes[0] || '-'}\n🥈 ${cfg.activeCompetition.prizes[1] || '-'}\n🥉 ${cfg.activeCompetition.prizes[2] || '-'}`;
   }
-  await bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, msg, { parse_mode: 'HTML', ...opts });
 }
 
 // -------- Auto-End Checker --------
@@ -653,7 +691,9 @@ async function seen(pool, tradeId) {
 
 async function safeSend(chatId, sendFn) {
   try {
-    await sendFn();
+    const cfg = await getChat(chatId);
+    const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+    await sendFn(opts);
   } catch (e) {
     const desc = e.response?.body?.description || '';
     if (desc.includes('kicked') || desc.includes('forbidden')) {
@@ -662,7 +702,9 @@ async function safeSend(chatId, sendFn) {
       else memoryStore.delete(chatId);
     } else if (desc.includes('file_id') || desc.includes('not found')) {
       console.warn(`[WARN] Invalid GIF file_id for chat ${chatId}, falling back to text or URL-based GIF`);
-      await sendFn(true);
+      const cfg = await getChat(chatId);
+      const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+      await sendFn(opts); // Retry with same opts
     } else {
       console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message, desc);
     }
@@ -750,19 +792,24 @@ async function broadcastTrade(pool, trade) {
       (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
       `🔗 <a href="${txUrl}">TX</a>`;
 
-    await safeSend(chatId, async (fallback = false) => {
-      if (!fallback && cfg.gifFileId && cfg.gifChatId === chatId) {
+    await safeSend(chatId, async (opts) => {
+      if (cfg.gifFileId && cfg.gifChatId === chatId) {
         await bot.sendAnimation(chatId, cfg.gifFileId, {
-          caption, parse_mode: 'HTML',
+          ...opts,
+          caption,
+          parse_mode: 'HTML',
           reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
         });
       } else if (cfg.gifUrl) {
         await bot.sendAnimation(chatId, cfg.gifUrl, {
-          caption, parse_mode: 'HTML',
+          ...opts,
+          caption,
+          parse_mode: 'HTML',
           reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
         });
       } else {
         await bot.sendMessage(chatId, caption, {
+          ...opts,
           parse_mode: 'HTML',
           disable_web_page_preview: true,
           reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
