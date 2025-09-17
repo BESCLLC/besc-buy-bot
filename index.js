@@ -179,7 +179,7 @@ async function sendSettingsPanel(chatId, messageId = null) {
       [{ text: cfg.showSells ? '🔴 Hide Sells' : '🟢 Show Sells', callback_data: 'toggle_sells' }],
       [
         { text: '🎞 Set GIF', callback_data: 'set_gif' },
-        { text: '🗑 Remove GIF', callback_data: 'remove_gif' } // New button to remove GIF
+        { text: '🗑 Remove GIF', callback_data: 'remove_gif' }
       ],
       [{ text: '🏆 Start Competition', callback_data: 'start_comp' },
        { text: '📊 Leaderboard', callback_data: 'show_leaderboard' },
@@ -198,6 +198,20 @@ async function sendSettingsPanel(chatId, messageId = null) {
 
 // -------- Handlers --------
 bot.onText(/\/settings|\/start/, (msg) => sendSettingsPanel(msg.chat.id));
+
+bot.onText(/\/resetchat/, async (msg) => {
+  const chatId = msg.chat.id;
+  await redis?.del(`chat:${chatId}:config`);
+  memoryStore.delete(chatId);
+  bot.sendMessage(chatId, '✅ Chat configuration reset. Use /settings to re-add pools.');
+});
+
+bot.onText(/\/resetpool (.+)/, async (msg, match) => {
+  const poolId = match[1].trim();
+  await redis?.del(`pool:${poolId}:lastTradeId`);
+  memoryStore.delete(`pool:${poolId}:lastTradeId`);
+  bot.sendMessage(msg.chat.id, `✅ Cleared lastTradeId for pool ${poolId}. Next trade will trigger.`);
+});
 
 bot.onText(/\/removegif/, async (msg) => {
   const chatId = msg.chat.id;
@@ -354,7 +368,7 @@ bot.on('message', async (msg) => {
     const cfg = await getChat(chatId);
     cfg.gifFileId = msg.animation.file_id;
     cfg.gifUrl = null;
-    cfg.gifChatId = chatId; // Store the chat ID where the GIF was uploaded
+    cfg.gifChatId = chatId;
     await setChat(chatId, cfg);
     pendingGif.delete(chatId);
     await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.');
@@ -648,8 +662,7 @@ async function safeSend(chatId, sendFn) {
       else memoryStore.delete(chatId);
     } else if (desc.includes('file_id') || desc.includes('not found')) {
       console.warn(`[WARN] Invalid GIF file_id for chat ${chatId}, falling back to text or URL-based GIF`);
-      // Do not reset GIF config here; let user manually remove it if needed
-      await sendFn(true); // Retry with fallback
+      await sendFn(true);
     } else {
       console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message, desc);
     }
