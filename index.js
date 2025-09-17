@@ -35,6 +35,11 @@ const awaitingTierInput = new Map();
 const awaitingRemoveChoice = new Map();
 const compWizard = new Map();
 
+// Global error handler to prevent crashes
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 // -------- Config helpers --------
 function defaultChatConfig() {
   return {
@@ -228,7 +233,7 @@ bot.onText(/\/settings|\/start/, async (msg) => {
     cfg.threadId = msg.message_thread_id;
     await setChat(chatId, cfg);
   }
-  await sendSettingsPanel(chatId); // Always send new message
+  await sendSettingsPanel(chatId);
 });
 
 bot.onText(/\/resetchat/, async (msg) => {
@@ -743,7 +748,8 @@ async function refreshPoolSet() {
   const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
   const set = new Set();
   for (const k of keys) {
-    const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(Number(k.split(':')[1]));
+    const chatId = Number(k.split(':')[1]);
+    const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
     (cfg?.pools || []).forEach(p => set.add(p));
   }
   poolRoundRobin = Array.from(set);
@@ -768,10 +774,15 @@ async function safeSend(chatId, sendFn) {
     await sendFn(opts);
   } catch (e) {
     const desc = e.response?.body?.description || '';
-    if (desc.includes('kicked') || desc.includes('forbidden')) {
-      console.log(`[INFO] Bot removed from chat ${chatId}, cleaning config`);
+    if (desc.includes('kicked') || desc.includes('forbidden') || desc.includes('group chat was upgraded to a supergroup chat')) {
+      console.log(`[INFO] Chat ${chatId} is invalid (kicked, forbidden, or upgraded to supergroup). Cleaning config.`);
       if (redis) await redis.del(`chat:${chatId}:config`);
       else memoryStore.delete(chatId);
+      try {
+        await bot.sendMessage(chatId, '⚠️ This chat was upgraded to a supergroup or the bot was removed. Please run /settings to reconfigure.', { ...opts });
+      } catch (notifyErr) {
+        console.warn(`[WARN] Could not notify chat ${chatId} about upgrade:`, notifyErr.message);
+      }
     } else if (desc.includes('file_id') || desc.includes('not found')) {
       console.warn(`[WARN] Invalid GIF file_id for chat ${chatId}, falling back to text or URL-based GIF`);
       const cfg = await getChat(chatId);
