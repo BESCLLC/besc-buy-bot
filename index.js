@@ -117,8 +117,8 @@ async function fetchTopPoolForToken(tokenAddr) {
     });
     const pools = data?.data?.relationships?.top_pools?.data || [];
     if (!pools.length) return null;
-
-    const pool = pools[0].id;
+    const poolId = pools[0].id;
+    const pool = poolId.split('_').pop(); // Strip network prefix
     const symbol = data?.data?.attributes?.symbol || 'TOKEN';
     return { pool, symbol };
   } catch (e) {
@@ -136,6 +136,19 @@ async function fetchTradesForPool(pool) {
     return normalizeTrades(data?.data);
   } catch (e) {
     console.error(`[GeckoTerminal] Failed for pool ${pool}:`, e.response?.status, e.response?.data || e.message);
+    if (e.response?.status === 404) {
+      // Notify chats tracking this pool
+      const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
+      for (const k of keys) {
+        const chatId = Number(k.split(':')[1]);
+        const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
+        if (cfg?.pools.includes(pool)) {
+          await safeSend(chatId, async (opts) => {
+            await bot.sendMessage(chatId, `⚠️ Pool ${pool} not found on network ${GECKO_NETWORK}. Please remove and re-add the token with /add.`, { ...opts });
+          });
+        }
+      }
+    }
     return [];
   }
 }
@@ -191,12 +204,12 @@ async function sendSettingsPanel(chatId, messageId = null) {
        { text: '📊 Leaderboard', callback_data: 'show_leaderboard' },
        { text: '🛑 End Competition', callback_data: 'end_comp' }],
       [{ text: '📊 Status', callback_data: 'show_status' },
-       { text: '🔄 Reset Thread', callback_data: 'reset_thread' }], // Added button
+       { text: '🔄 Reset Thread', callback_data: 'reset_thread' }],
       [{ text: '✅ Done', callback_data: 'done_settings' }]
     ]
   };
 
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
 
   try {
     if (messageId) {
@@ -221,6 +234,7 @@ async function sendSettingsPanel(chatId, messageId = null) {
       if (error.message.includes("message thread not found")) {
         cfg.threadId = null;
         await setChat(chatId, cfg);
+        console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
         await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
       }
       await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
@@ -232,29 +246,33 @@ async function sendSettingsPanel(chatId, messageId = null) {
 
 // -------- Handlers --------
 bot.onText(/\/settings|\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
+  const cfg = await getChat(msg.chat.id);
   if (msg.message_thread_id) {
-    // Validate threadId before saving
     try {
-      await bot.sendMessage(chatId, 'Validating topic...', { message_thread_id: msg.message_thread_id });
+      await bot.sendMessage(msg.chat.id, 'Validating topic...', { message_thread_id: msg.message_thread_id });
       cfg.threadId = msg.message_thread_id;
-      await setChat(chatId, cfg);
-      await bot.deleteMessage(chatId, (await bot.getUpdates({ limit: 1 }))[0].message.message_id);
+      await setChat(msg.chat.id, cfg);
+      console.log(`[INFO] Captured threadId=${cfg.threadId} for chat ${msg.chat.id}`);
+      await bot.deleteMessage(msg.chat.id, (await bot.getUpdates({ limit: 1 }))[0].message.message_id);
     } catch (error) {
-      console.warn(`[WARN] Invalid thread ID ${msg.message_thread_id} for chat ${chatId}:`, error.message);
+      console.warn(`[WARN] Invalid thread ID ${msg.message_thread_id} for chat ${msg.chat.id}:`, error.message);
       cfg.threadId = null;
-      await setChat(chatId, cfg);
-      await bot.sendMessage(chatId, '⚠️ Invalid topic. Please run /settings in a valid topic.', {});
+      await setChat(msg.chat.id, cfg);
+      console.log(`[INFO] Cleared threadId for chat ${msg.chat.id} (invalid topic)`);
+      await bot.sendMessage(msg.chat.id, '⚠️ Invalid topic. Please run /settings in a valid topic.', {});
     }
+  } else {
+    cfg.threadId = null;
+    await setChat(msg.chat.id, cfg);
+    console.log(`[INFO] Cleared threadId for chat ${msg.chat.id} (no message_thread_id)`);
   }
-  await sendSettingsPanel(chatId);
+  await sendSettingsPanel(msg.chat.id);
 });
 
 bot.onText(/\/resetchat/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   await redis?.del(`chat:${chatId}:config`);
   memoryStore.delete(chatId);
   await bot.sendMessage(chatId, '✅ Chat configuration reset. Use /settings to re-add pools.', { ...opts });
@@ -263,16 +281,17 @@ bot.onText(/\/resetchat/, async (msg) => {
 bot.onText(/\/resetthread/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   cfg.threadId = null;
   await setChat(chatId, cfg);
+  console.log(`[INFO] Cleared threadId for chat ${chatId} via /resetthread`);
   await bot.sendMessage(chatId, '✅ Topic thread ID cleared. Run /settings in a valid topic to set a new one.', { ...opts });
 });
 
 bot.onText(/\/resetpool (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const poolId = match[1].trim();
   await redis?.del(`pool:${poolId}:lastTradeId`);
   memoryStore.delete(`pool:${poolId}:lastTradeId`);
@@ -282,7 +301,7 @@ bot.onText(/\/resetpool (.+)/, async (msg, match) => {
 bot.onText(/\/removegif/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   cfg.gifFileId = null;
   cfg.gifUrl = null;
   cfg.gifChatId = null;
@@ -293,7 +312,7 @@ bot.onText(/\/removegif/, async (msg) => {
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   await bot.answerCallbackQuery(query.id);
 
   switch (query.data) {
@@ -327,6 +346,7 @@ bot.on('callback_query', async (query) => {
           if (error.message.includes("message thread not found")) {
             cfg.threadId = null;
             await setChat(chatId, cfg);
+            console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
             await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
           }
           await bot.sendMessage(chatId, 'Select a token to remove:', {
@@ -382,6 +402,7 @@ bot.on('callback_query', async (query) => {
           if (error.message.includes("message thread not found")) {
             cfg.threadId = null;
             await setChat(chatId, cfg);
+            console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
             await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
           }
           await bot.sendMessage(chatId, 
@@ -437,6 +458,7 @@ bot.on('callback_query', async (query) => {
     case 'reset_thread':
       cfg.threadId = null;
       await setChat(chatId, cfg);
+      console.log(`[INFO] Cleared threadId for chat ${chatId} via reset_thread callback`);
       await bot.answerCallbackQuery(query.id, { text: 'Thread ID cleared.' });
       await bot.sendMessage(chatId, '✅ Topic thread ID cleared. Run /settings in a valid topic to set a new one.', {});
       await sendSettingsPanel(chatId, query.message.message_id);
@@ -494,7 +516,7 @@ bot.on('callback_query', async (query) => {
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
 
   if (msg.text && msg.text.startsWith('/')) {
     return;
@@ -616,7 +638,7 @@ bot.on('message', async (msg) => {
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const token = match[1];
   const top = await fetchTopPoolForToken(token);
   if (!top) return bot.sendMessage(chatId, '❌ No pool found for that token on this network.', { ...opts });
@@ -634,7 +656,7 @@ bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
 bot.onText(/\/remove (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const token = match[1];
   const top = await fetchTopPoolForToken(token);
   if (!top) return bot.sendMessage(chatId, '❌ Could not resolve a pool for that token.', { ...opts });
@@ -647,7 +669,7 @@ bot.onText(/\/remove (0x[a-fA-F0-9]{40})/, async (msg, match) => {
 bot.onText(/\/list/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   if (!cfg.pools.length) return bot.sendMessage(chatId, 'No pools yet. Add with /add 0xYourToken or use /settings → Add Token', { ...opts });
   const lines = cfg.pools.map(p => `• <code>${p}</code> (${escapeHtml(cfg.tokenSymbols[p] || 'TOKEN')})`);
   await bot.sendMessage(chatId, `<b>Tracking:</b>\n${lines.join('\n')}`, { parse_mode: 'HTML', ...opts });
@@ -656,7 +678,7 @@ bot.onText(/\/list/, async (msg) => {
 bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const min = Number(match[1]);
   cfg.minBuyUsd = min;
   await setChat(chatId, cfg);
@@ -666,7 +688,7 @@ bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
 bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   if (match[1]) {
     cfg.gifUrl = match[1];
     cfg.gifFileId = null;
@@ -682,7 +704,7 @@ bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
 bot.on('animation', async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   if (!pendingGif.get(chatId)) return;
   cfg.gifFileId = msg.animation.file_id;
   cfg.gifUrl = null;
@@ -695,7 +717,7 @@ bot.on('animation', async (msg) => {
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const which = match[1];
   const value = match[2];
   cfg.emoji[which] = value;
@@ -706,7 +728,7 @@ bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
 bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const which = match[1];
   const value = Number(match[2]);
   cfg.tiers[which] = value;
@@ -717,7 +739,7 @@ bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
 bot.onText(/\/showsells (on|off)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const value = match[1].toLowerCase() === 'on';
   cfg.showSells = value;
   await setChat(chatId, cfg);
@@ -727,7 +749,7 @@ bot.onText(/\/showsells (on|off)/, async (msg, match) => {
 bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
   const statusText =
     `<b>Current Config</b>\n` +
@@ -744,14 +766,14 @@ bot.onText(/\/status/, async (msg) => {
 bot.onText(/\/ping/, async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   await bot.sendMessage(chatId, '✅ Bot is online and running.', { ...opts });
 });
 
 // -------- Leaderboard + Competition --------
 async function postLeaderboard(chatId, final = false) {
   const cfg = await getChat(chatId);
-  const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+  const opts = { message_thread_id: cfg.threadId || undefined };
   if (!cfg.activeCompetition) return await bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
   const lb = Object.entries(cfg.activeCompetition.leaderboard || {}).sort((a,b) => b[1] - a[1]);
   if (!lb.length) return await bot.sendMessage(chatId, final ? 'No qualifying buys. Competition ended.' : 'No entries yet.', { ...opts });
@@ -808,7 +830,7 @@ async function seen(pool, tradeId) {
 async function safeSend(chatId, sendFn) {
   try {
     const cfg = await getChat(chatId);
-    const opts = cfg.threadId ? { message_thread_id: cfg.threadId } : {};
+    const opts = { message_thread_id: cfg.threadId || undefined };
     await sendFn(opts);
   } catch (e) {
     const desc = e.response?.body?.description || '';
@@ -827,6 +849,7 @@ async function safeSend(chatId, sendFn) {
       if (desc.includes('message thread not found')) {
         cfg.threadId = null;
         await setChat(chatId, cfg);
+        console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
         try {
           await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
         } catch (notifyErr) {
@@ -924,23 +947,25 @@ async function broadcastTrade(pool, trade) {
     await safeSend(chatId, async (opts) => {
       if (cfg.gifFileId && cfg.gifChatId === chatId) {
         await bot.sendAnimation(chatId, cfg.gifFileId, {
-          ...opts,
-          caption,
           parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          message_thread_id: cfg.threadId || undefined,
+          caption,
           reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
         });
       } else if (cfg.gifUrl) {
         await bot.sendAnimation(chatId, cfg.gifUrl, {
-          ...opts,
-          caption,
           parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          message_thread_id: cfg.threadId || undefined,
+          caption,
           reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
         });
       } else {
         await bot.sendMessage(chatId, caption, {
-          ...opts,
           parse_mode: 'HTML',
           disable_web_page_preview: true,
+          message_thread_id: cfg.threadId || undefined,
           reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
         });
       }
