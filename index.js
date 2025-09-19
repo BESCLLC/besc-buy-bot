@@ -10,14 +10,14 @@ const {
   GECKO_NETWORK = 'besc-hyperchain',
   EXPLORER_TX_URL = 'https://explorer.beschyperchain.com/tx/',
   REDIS_URL,
-  POLL_INTERVAL_MS = '1000'
+  POLL_INTERVAL_MS = '400'
 } = process.env;
 
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
-const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 1 });
+const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 5 });
 
 const app = express();
 app.get('/healthz', (_, res) => res.send('ok'));
