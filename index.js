@@ -10,7 +10,7 @@ const {
   GECKO_NETWORK = 'besc-hyperchain',
   EXPLORER_TX_URL = 'https://explorer.beschyperchain.com/tx/',
   REDIS_URL,
-  POLL_INTERVAL_MS = '2000'
+  POLL_INTERVAL_MS = '1000'
 } = process.env;
 
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
