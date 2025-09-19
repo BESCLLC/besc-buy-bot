@@ -28,7 +28,7 @@ const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const memoryStore = new Map();
 
 // State maps for inline flows
-const pendingGif = new Map();
+const pendingVideo = new Map(); // CHANGED: from pendingGif
 const awaitingTokenInput = new Map();
 const awaitingMinBuyInput = new Map();
 const awaitingTierInput = new Map();
@@ -38,7 +38,6 @@ const compWizard = new Map();
 // Global error handler to prevent crashes
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
-  // Don't let the process die - log and continue
 });
 
 // -------- Config helpers --------
@@ -46,10 +45,10 @@ function defaultChatConfig() {
   return {
     pools: [],
     minBuyUsd: 0,
-    gifUrl: null,
-    gifFileId: null,
-    gifChatId: null,
-    gifValid: false, // New: track if GIF is valid
+    videoUrl: null, // CHANGED: from gifUrl
+    videoFileId: null, // CHANGED: from gifFileId
+    videoChatId: null, // CHANGED: from gifChatId
+    videoValid: false, // CHANGED: from gifValid
     threadId: null,
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
@@ -110,21 +109,70 @@ function adjustSupply(supplyLike, decimals = 18) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// -------- NEW: GIF Validation Helper --------
-async function validateGifFileId(chatId, fileId) {
+// -------- Video validation helper --------
+async function validateVideoFileId(chatId, fileId) {
   try {
-    // Test send the GIF to a private chat or just validate by getting file info
     const file = await bot.getFile(fileId);
-    if (file.file_path && file.file_size < 50 * 1024 * 1024) { // 50MB limit
-      console.log(`[GIF] Validated file_id ${fileId} for chat ${chatId}: ${file.file_path}`);
+    if (file.file_path && file.file_size < 50 * 1024 * 1024 && 
+        (file.file_path.endsWith('.mp4') || file.mime_type?.startsWith('video/'))) {
+      console.log(`[VIDEO] Validated file_id ${fileId} for chat ${chatId}: ${file.file_path}`);
       return true;
     }
-    console.warn(`[GIF] Invalid file_id ${fileId} for chat ${chatId}: size or path issue`);
+    console.warn(`[VIDEO] Invalid file_id ${fileId} for chat ${chatId}: size/MIME issue`);
     return false;
   } catch (error) {
-    console.error(`[GIF] Failed to validate file_id ${fileId}:`, error.message);
+    console.error(`[VIDEO] Failed to validate file_id ${fileId}:`, error.message);
     return false;
   }
+}
+
+// -------- Safe video sender --------
+async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId) {
+  const { videoFileId, videoUrl, videoValid } = videoConfig;
+  
+  // Try URL first (most reliable for videos)
+  if (videoUrl) {
+    try {
+      console.log(`[VIDEO] Sending URL video: ${videoUrl}`);
+      await bot.sendVideo(chatId, videoUrl, {
+        caption,
+        reply_markup: replyMarkup,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        message_thread_id: threadId,
+        supports_streaming: true
+      });
+      return true;
+    } catch (urlError) {
+      console.warn(`[VIDEO] URL video failed: ${urlError.message}`);
+    }
+  }
+  
+  // Try file_id if valid
+  if (videoFileId && videoValid) {
+    try {
+      console.log(`[VIDEO] Sending file_id video: ${videoFileId}`);
+      await bot.sendVideo(chatId, videoFileId, {
+        caption,
+        reply_markup: replyMarkup,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        message_thread_id: threadId,
+        supports_streaming: true
+      });
+      return true;
+    } catch (fileError) {
+      console.error(`[VIDEO] File_id video failed: ${fileError.message}`);
+      // Mark invalid and fallback
+      const cfg = await getChat(chatId);
+      cfg.videoValid = false;
+      await setChat(chatId, cfg);
+    }
+  }
+  
+  // Fallback to text
+  console.log(`[VIDEO] Falling back to text for chat ${chatId}`);
+  return false;
 }
 
 // -------- GeckoTerminal wrappers --------
@@ -193,62 +241,14 @@ function normalizeTrades(items) {
   });
 }
 
-// -------- NEW: Safe GIF Sender --------
-async function safeSendGif(chatId, gifConfig, caption, replyMarkup, threadId) {
-  const { gifFileId, gifUrl, gifValid } = gifConfig;
-  
-  // If we have a URL, try that first (more reliable)
-  if (gifUrl) {
-    try {
-      console.log(`[GIF] Sending URL animation: ${gifUrl}`);
-      await bot.sendAnimation(chatId, gifUrl, {
-        caption,
-        reply_markup: replyMarkup,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        message_thread_id: threadId
-      });
-      return true;
-    } catch (urlError) {
-      console.warn(`[GIF] URL animation failed: ${urlError.message}`);
-      // Continue to try file_id if URL fails
-    }
-  }
-  
-  // Try file_id if we have it and it's marked valid
-  if (gifFileId && gifValid) {
-    try {
-      console.log(`[GIF] Sending file_id animation: ${gifFileId}`);
-      await bot.sendAnimation(chatId, gifFileId, {
-        caption,
-        reply_markup: replyMarkup,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        message_thread_id: threadId
-      });
-      return true;
-    } catch (fileError) {
-      console.error(`[GIF] File_id animation failed: ${fileError.message}`);
-      // Mark as invalid and continue to text fallback
-      const cfg = await getChat(chatId);
-      cfg.gifValid = false;
-      await setChat(chatId, cfg);
-    }
-  }
-  
-  // Fallback to text message
-  console.log(`[GIF] Falling back to text message for chat ${chatId}`);
-  return false; // Indicates fallback was used
-}
-
 // -------- Inline Settings Panel --------
 async function sendSettingsPanel(chatId, messageId = null) {
   const cfg = await getChat(chatId);
   const tokens = cfg.pools.length
     ? cfg.pools.map(p => cfg.tokenSymbols[p] || (p.slice(0,6)+'…'+p.slice(-4))).join(', ')
     : 'None';
-  const gifStatus = cfg.gifFileId ? (cfg.gifValid ? '✅ valid' : '⚠️ invalid') : 
-                   (cfg.gifUrl ? '🔗 URL' : '❌ none');
+  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? '✅ valid' : '⚠️ invalid') : 
+                     (cfg.videoUrl ? '🔗 URL' : '❌ none'); // CHANGED: videoStatus
   
   const text =
     `⚙️ <b>Settings Panel</b>\n` +
@@ -256,7 +256,7 @@ async function sendSettingsPanel(chatId, messageId = null) {
     `<b>Min Buy:</b> $${cfg.minBuyUsd}\n` +
     `<b>Whale Tier:</b> $${cfg.tiers.large} | Mid $${cfg.tiers.small}\n` +
     `<b>Sells:</b> ${cfg.showSells ? 'ON' : 'OFF'}\n` +
-    `<b>GIF:</b> ${gifStatus}\n` +
+    `<b>Video:</b> ${videoStatus}\n` + // CHANGED: from GIF
     `<b>Competition:</b> ${cfg.activeCompetition ? '🏆 ACTIVE' : '—'}`;
 
   const keyboard = {
@@ -267,8 +267,8 @@ async function sendSettingsPanel(chatId, messageId = null) {
        { text: '🐋 Whale Tier', callback_data: 'tier_menu' }],
       [{ text: cfg.showSells ? '🔴 Hide Sells' : '🟢 Show Sells', callback_data: 'toggle_sells' }],
       [
-        { text: '🎞 Set GIF', callback_data: 'set_gif' },
-        { text: '🗑 Remove GIF', callback_data: 'remove_gif' }
+        { text: '🎞 Set Video', callback_data: 'set_video' }, // CHANGED: from set_gif
+        { text: '🗑 Remove Video', callback_data: 'remove_video' } // CHANGED: from remove_gif
       ],
       [{ text: '🏆 Start Competition', callback_data: 'start_comp' },
        { text: '📊 Leaderboard', callback_data: 'show_leaderboard' },
@@ -368,16 +368,16 @@ bot.onText(/\/resetpool (.+)/, async (msg, match) => {
   await bot.sendMessage(chatId, `✅ Cleared lastTradeId for pool ${poolId}. Next trade will trigger.`, { ...opts });
 });
 
-bot.onText(/\/removegif/, async (msg) => {
+bot.onText(/\/removevideo/, async (msg) => { // CHANGED: from /removegif
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
-  cfg.gifFileId = null;
-  cfg.gifUrl = null;
-  cfg.gifChatId = null;
-  cfg.gifValid = false;
+  cfg.videoFileId = null; // CHANGED
+  cfg.videoUrl = null; // CHANGED
+  cfg.videoChatId = null; // CHANGED
+  cfg.videoValid = false; // CHANGED
   await setChat(chatId, cfg);
-  await bot.sendMessage(chatId, '🗑 GIF removed. Alerts will use text only.', { ...opts });
+  await bot.sendMessage(chatId, '🗑 Video removed. Alerts will use text only.', { ...opts });
 });
 
 bot.on('callback_query', async (query) => {
@@ -512,22 +512,22 @@ bot.on('callback_query', async (query) => {
       await sendSettingsPanel(chatId, query.message.message_id);
       break;
 
-    case 'set_gif':
-      pendingGif.set(chatId, true);
+    case 'set_video': // CHANGED: from set_gif
+      pendingVideo.set(chatId, true); // CHANGED
       await bot.sendMessage(chatId, 
-        '📎 Send the GIF/animation you want to use for alerts (as an animation, max 50MB).\n' +
-        'Or reply with a direct GIF URL.', 
+        '📹 Send the video (MP4, max 50MB) you want to use for alerts.\n' +
+        'Or reply with a direct MP4 URL.', 
         { ...opts }
       );
       break;
 
-    case 'remove_gif':
-      cfg.gifFileId = null;
-      cfg.gifUrl = null;
-      cfg.gifChatId = null;
-      cfg.gifValid = false;
+    case 'remove_video': // CHANGED: from remove_gif
+      cfg.videoFileId = null; // CHANGED
+      cfg.videoUrl = null; // CHANGED
+      cfg.videoChatId = null; // CHANGED
+      cfg.videoValid = false; // CHANGED
       await setChat(chatId, cfg);
-      await bot.answerCallbackQuery(query.id, { text: 'GIF removed.' });
+      await bot.answerCallbackQuery(query.id, { text: 'Video removed.' });
       await sendSettingsPanel(chatId, query.message.message_id);
       break;
 
@@ -588,35 +588,38 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// -------- FIXED: Single Message Handler --------
+// -------- Message handlers --------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
 
-  // Skip commands
   if (msg.text && msg.text.startsWith('/')) {
     return;
   }
 
-  // Handle GIF setting - FIXED: Handle both animations and URLs
-  if (pendingGif.has(chatId)) {
-    if (msg.animation) {
-      // Handle animation/GIF
-      const fileId = msg.animation.file_id;
-      console.log(`[GIF] Received animation with file_id: ${fileId}`);
+  // Handle video setting
+  if (pendingVideo.has(chatId)) { // CHANGED
+    if (msg.video || (msg.document && msg.document.mime_type?.startsWith('video/'))) { // CHANGED: Check for video
+      let fileId;
+      if (msg.video) {
+        fileId = msg.video.file_id;
+      } else if (msg.document) {
+        fileId = msg.document.file_id;
+      }
+      console.log(`[VIDEO] Received video with file_id: ${fileId}`);
       
       // Validate the file
-      const isValid = await validateGifFileId(chatId, fileId);
+      const isValid = await validateVideoFileId(chatId, fileId); // CHANGED
       
-      cfg.gifFileId = fileId;
-      cfg.gifUrl = null;
-      cfg.gifChatId = chatId;
-      cfg.gifValid = isValid;
+      cfg.videoFileId = fileId; // CHANGED
+      cfg.videoUrl = null; // CHANGED
+      cfg.videoChatId = chatId; // CHANGED
+      cfg.videoValid = isValid; // CHANGED
       await setChat(chatId, cfg);
-      pendingGif.delete(chatId);
+      pendingVideo.delete(chatId); // CHANGED
       
-      const status = isValid ? '✅ GIF saved and validated!' : '⚠️ GIF saved but validation failed (will fallback to text)';
+      const status = isValid ? '✅ Video saved and validated!' : '⚠️ Video saved but validation failed (will fallback to text)';
       await bot.sendMessage(chatId, 
         `${status}\nWill play on every buy alert in this chat.`, 
         { ...opts }
@@ -624,29 +627,28 @@ bot.on('message', async (msg) => {
     } else if (msg.text && msg.text.startsWith('http')) {
       // Handle URL
       const url = msg.text.trim();
-      console.log(`[GIF] Received URL: ${url}`);
+      console.log(`[VIDEO] Received URL: ${url}`);
       
-      cfg.gifUrl = url;
-      cfg.gifFileId = null;
-      cfg.gifChatId = chatId;
-      cfg.gifValid = true; // URLs don't need validation
+      cfg.videoUrl = url; // CHANGED
+      cfg.videoFileId = null; // CHANGED
+      cfg.videoChatId = chatId; // CHANGED
+      cfg.videoValid = true; // URLs don't need validation
       await setChat(chatId, cfg);
-      pendingGif.delete(chatId);
+      pendingVideo.delete(chatId); // CHANGED
       
       await bot.sendMessage(chatId, 
-        `✅ GIF URL saved!\nWill use this animation for every buy alert.`, 
+        `✅ Video URL saved!\nWill use this MP4 for every buy alert.`, 
         { ...opts }
       );
     } else {
       await bot.sendMessage(chatId, 
-        '❌ Please send an animation/GIF file or a direct GIF URL.', 
+        '❌ Please send an MP4 video file or a direct MP4 URL.', 
         { ...opts }
       );
     }
     return;
   }
 
-  // Handle other text inputs
   if (!msg.text) return;
 
   if (awaitingTokenInput.has(chatId)) {
@@ -749,8 +751,6 @@ bot.on('message', async (msg) => {
   }
 });
 
-// -------- REMOVED: Duplicate animation handler - now handled in main message handler
-
 // -------- Backward-compatible commands --------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -802,31 +802,30 @@ bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
   await bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`, { ...opts });
 });
 
-bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
+bot.onText(/\/setvideo(?: (https?:\/\/\S+))?$/, async (msg, match) => { // CHANGED: from /setgif
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
   
   if (match[1]) {
     // URL provided
-    cfg.gifUrl = match[1];
-    cfg.gifFileId = null;
-    cfg.gifChatId = chatId;
-    cfg.gifValid = true;
+    cfg.videoUrl = match[1]; // CHANGED
+    cfg.videoFileId = null; // CHANGED
+    cfg.videoChatId = chatId; // CHANGED
+    cfg.videoValid = true;
     await setChat(chatId, cfg);
-    await bot.sendMessage(chatId, '✅ GIF URL set.', { ...opts });
+    await bot.sendMessage(chatId, '✅ Video URL set.', { ...opts });
   } else {
-    // Wait for animation
-    pendingGif.set(chatId, true);
+    // Wait for video
+    pendingVideo.set(chatId, true); // CHANGED
     await bot.sendMessage(chatId, 
-      '📎 Send the GIF/animation you want to use for alerts (as an animation, max 50MB).\n' +
-      'Or send a direct GIF URL in your next message.', 
+      '📹 Send the MP4 video (max 50MB) for alerts.\n' +
+      'Or send a direct MP4 URL next.', 
       { ...opts }
     );
   }
 });
 
-// -------- Updated commands with better GIF handling
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
@@ -864,15 +863,15 @@ bot.onText(/\/status/, async (msg) => {
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
-  const gifStatus = cfg.gifFileId ? (cfg.gifValid ? `✅ custom set (chat ${cfg.gifChatId})` : `⚠️ invalid file (chat ${cfg.gifChatId})`) : 
-                   (cfg.gifUrl ? `🔗 ${cfg.gifUrl}` : '❌ none');
+  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? `✅ custom set (chat ${cfg.videoChatId})` : `⚠️ invalid file (chat ${cfg.videoChatId})`) : 
+                     (cfg.videoUrl ? `🔗 ${cfg.videoUrl}` : '❌ none'); // CHANGED
   const statusText =
     `<b>Current Config</b>\n` +
     `Pools:\n${pools}\n\n` +
     `Min Buy: $${cfg.minBuyUsd}\n` +
     `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
     `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
-    `GIF: ${gifStatus}\n` +
+    `Video: ${videoStatus}\n` + // CHANGED: from GIF
     `Thread ID: ${cfg.threadId ? cfg.threadId : 'None'}\n` +
     `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
   await bot.sendMessage(chatId, statusText, { parse_mode: 'HTML', ...opts });
@@ -995,7 +994,7 @@ async function safeSend(chatId, sendFn) {
         console.warn(`[WARN] Could not notify chat ${chatId} about upgrade:`, notifyErr.message);
       }
     } else if (desc.includes('file_id') || desc.includes('not found') || desc.includes('message thread not found')) {
-      console.warn(`[WARN] Invalid operation for chat ${chatId} (GIF file_id or thread not found). Falling back.`);
+      console.warn(`[WARN] Invalid operation for chat ${chatId} (video file_id or thread not found). Falling back.`);
       const cfg = await getChat(chatId);
       if (desc.includes('message thread not found')) {
         cfg.threadId = null;
@@ -1099,9 +1098,9 @@ async function broadcastTrade(pool, trade) {
       inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] 
     };
 
-    // FIXED: Use safe GIF sender with fallback
+    // Use safe video sender with fallback
     await safeSend(chatId, async (sendOpts) => {
-      const usedGif = await safeSendGif(
+      const usedVideo = await safeSendVideo( // CHANGED: safeSendVideo
         chatId, 
         cfg, 
         caption, 
@@ -1109,7 +1108,7 @@ async function broadcastTrade(pool, trade) {
         cfg.threadId
       );
       
-      if (!usedGif) {
+      if (!usedVideo) {
         // Fallback to text message
         await bot.sendMessage(chatId, caption, {
           parse_mode: 'HTML',
