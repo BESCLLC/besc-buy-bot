@@ -805,17 +805,53 @@ setInterval(async () => {
 let poolRoundRobin = [];
 
 async function refreshPoolSet() {
-  const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
-  const set = new Set();
-  for (const k of keys) {
-    const chatId = Number(k.split(':')[1]);
-    const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
-    (cfg?.pools || []).forEach(p => set.add(p));
+  try {
+    const keys = redis
+      ? await redis.keys('chat:*:config')
+      : [...memoryStore.keys()].map(k => `chat:${k}:config`);
+
+    const set = new Set();
+
+    console.log(`[DEBUG] refreshPoolSet found ${keys.length} chat configs`);
+
+    for (const k of keys) {
+      const chatId = Number(k.split(':')[1]);
+      let cfg;
+
+      try {
+        cfg = redis ? JSON.parse(await redis.get(k) || '{}') : memoryStore.get(chatId);
+      } catch (err) {
+        console.error(`[ERROR] Failed to parse config for chat ${chatId}:`, err.message);
+        continue;
+      }
+
+      if (!cfg) {
+        console.warn(`[WARN] No config for chat ${chatId}`);
+        continue;
+      }
+
+      if (!cfg.pools || cfg.pools.length === 0) {
+        console.debug(`[DEBUG] Chat ${chatId} has no pools configured`);
+        continue;
+      }
+
+      cfg.pools.forEach((p) => {
+        console.debug(`[DEBUG] Adding pool ${p} from chat ${chatId}`);
+        set.add(p);
+      });
+    }
+
+    poolRoundRobin = Array.from(set);
+    console.log(`[INFO] poolRoundRobin now has ${poolRoundRobin.length} pools:`, poolRoundRobin);
+
+  } catch (e) {
+    console.error(`[ERROR] refreshPoolSet failed:`, e.message);
   }
-  poolRoundRobin = Array.from(set);
 }
-setInterval(refreshPoolSet, 10000);
+
+// Call once at startup, then every 10s
 refreshPoolSet();
+setInterval(refreshPoolSet, 10000);
 
 async function seen(pool, tradeId) {
   if (!tradeId) return false;
