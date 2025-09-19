@@ -38,6 +38,7 @@ const compWizard = new Map();
 // Global error handler to prevent crashes
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
+  // Don't let the process die - log and continue
 });
 
 // -------- Config helpers --------
@@ -48,6 +49,7 @@ function defaultChatConfig() {
     gifUrl: null,
     gifFileId: null,
     gifChatId: null,
+    gifValid: false, // New: track if GIF is valid
     threadId: null,
     emoji: { small: '🟢', mid: '💎', large: '🐋' },
     tiers: { small: 100, large: 1000 },
@@ -106,6 +108,23 @@ function adjustSupply(supplyLike, decimals = 18) {
   }
   const n = Number(str);
   return Number.isFinite(n) ? n : 0;
+}
+
+// -------- NEW: GIF Validation Helper --------
+async function validateGifFileId(chatId, fileId) {
+  try {
+    // Test send the GIF to a private chat or just validate by getting file info
+    const file = await bot.getFile(fileId);
+    if (file.file_path && file.file_size < 50 * 1024 * 1024) { // 50MB limit
+      console.log(`[GIF] Validated file_id ${fileId} for chat ${chatId}: ${file.file_path}`);
+      return true;
+    }
+    console.warn(`[GIF] Invalid file_id ${fileId} for chat ${chatId}: size or path issue`);
+    return false;
+  } catch (error) {
+    console.error(`[GIF] Failed to validate file_id ${fileId}:`, error.message);
+    return false;
+  }
 }
 
 // -------- GeckoTerminal wrappers --------
@@ -174,19 +193,70 @@ function normalizeTrades(items) {
   });
 }
 
+// -------- NEW: Safe GIF Sender --------
+async function safeSendGif(chatId, gifConfig, caption, replyMarkup, threadId) {
+  const { gifFileId, gifUrl, gifValid } = gifConfig;
+  
+  // If we have a URL, try that first (more reliable)
+  if (gifUrl) {
+    try {
+      console.log(`[GIF] Sending URL animation: ${gifUrl}`);
+      await bot.sendAnimation(chatId, gifUrl, {
+        caption,
+        reply_markup: replyMarkup,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        message_thread_id: threadId
+      });
+      return true;
+    } catch (urlError) {
+      console.warn(`[GIF] URL animation failed: ${urlError.message}`);
+      // Continue to try file_id if URL fails
+    }
+  }
+  
+  // Try file_id if we have it and it's marked valid
+  if (gifFileId && gifValid) {
+    try {
+      console.log(`[GIF] Sending file_id animation: ${gifFileId}`);
+      await bot.sendAnimation(chatId, gifFileId, {
+        caption,
+        reply_markup: replyMarkup,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        message_thread_id: threadId
+      });
+      return true;
+    } catch (fileError) {
+      console.error(`[GIF] File_id animation failed: ${fileError.message}`);
+      // Mark as invalid and continue to text fallback
+      const cfg = await getChat(chatId);
+      cfg.gifValid = false;
+      await setChat(chatId, cfg);
+    }
+  }
+  
+  // Fallback to text message
+  console.log(`[GIF] Falling back to text message for chat ${chatId}`);
+  return false; // Indicates fallback was used
+}
+
 // -------- Inline Settings Panel --------
 async function sendSettingsPanel(chatId, messageId = null) {
   const cfg = await getChat(chatId);
   const tokens = cfg.pools.length
     ? cfg.pools.map(p => cfg.tokenSymbols[p] || (p.slice(0,6)+'…'+p.slice(-4))).join(', ')
     : 'None';
+  const gifStatus = cfg.gifFileId ? (cfg.gifValid ? '✅ valid' : '⚠️ invalid') : 
+                   (cfg.gifUrl ? '🔗 URL' : '❌ none');
+  
   const text =
     `⚙️ <b>Settings Panel</b>\n` +
     `<b>Tracking:</b> ${escapeHtml(tokens)}\n` +
     `<b>Min Buy:</b> $${cfg.minBuyUsd}\n` +
     `<b>Whale Tier:</b> $${cfg.tiers.large} | Mid $${cfg.tiers.small}\n` +
     `<b>Sells:</b> ${cfg.showSells ? 'ON' : 'OFF'}\n` +
-    `<b>GIF:</b> ${cfg.gifFileId ? '✅ custom' : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
+    `<b>GIF:</b> ${gifStatus}\n` +
     `<b>Competition:</b> ${cfg.activeCompetition ? '🏆 ACTIVE' : '—'}`;
 
   const keyboard = {
@@ -305,6 +375,7 @@ bot.onText(/\/removegif/, async (msg) => {
   cfg.gifFileId = null;
   cfg.gifUrl = null;
   cfg.gifChatId = null;
+  cfg.gifValid = false;
   await setChat(chatId, cfg);
   await bot.sendMessage(chatId, '🗑 GIF removed. Alerts will use text only.', { ...opts });
 });
@@ -443,13 +514,18 @@ bot.on('callback_query', async (query) => {
 
     case 'set_gif':
       pendingGif.set(chatId, true);
-      await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts (as an animation).', { ...opts });
+      await bot.sendMessage(chatId, 
+        '📎 Send the GIF/animation you want to use for alerts (as an animation, max 50MB).\n' +
+        'Or reply with a direct GIF URL.', 
+        { ...opts }
+      );
       break;
 
     case 'remove_gif':
       cfg.gifFileId = null;
       cfg.gifUrl = null;
       cfg.gifChatId = null;
+      cfg.gifValid = false;
       await setChat(chatId, cfg);
       await bot.answerCallbackQuery(query.id, { text: 'GIF removed.' });
       await sendSettingsPanel(chatId, query.message.message_id);
@@ -512,26 +588,65 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// -------- Message handlers --------
+// -------- FIXED: Single Message Handler --------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
 
+  // Skip commands
   if (msg.text && msg.text.startsWith('/')) {
     return;
   }
 
-  if (msg.animation && pendingGif.has(chatId)) {
-    cfg.gifFileId = msg.animation.file_id;
-    cfg.gifUrl = null;
-    cfg.gifChatId = chatId;
-    await setChat(chatId, cfg);
-    pendingGif.delete(chatId);
-    await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.', { ...opts });
+  // Handle GIF setting - FIXED: Handle both animations and URLs
+  if (pendingGif.has(chatId)) {
+    if (msg.animation) {
+      // Handle animation/GIF
+      const fileId = msg.animation.file_id;
+      console.log(`[GIF] Received animation with file_id: ${fileId}`);
+      
+      // Validate the file
+      const isValid = await validateGifFileId(chatId, fileId);
+      
+      cfg.gifFileId = fileId;
+      cfg.gifUrl = null;
+      cfg.gifChatId = chatId;
+      cfg.gifValid = isValid;
+      await setChat(chatId, cfg);
+      pendingGif.delete(chatId);
+      
+      const status = isValid ? '✅ GIF saved and validated!' : '⚠️ GIF saved but validation failed (will fallback to text)';
+      await bot.sendMessage(chatId, 
+        `${status}\nWill play on every buy alert in this chat.`, 
+        { ...opts }
+      );
+    } else if (msg.text && msg.text.startsWith('http')) {
+      // Handle URL
+      const url = msg.text.trim();
+      console.log(`[GIF] Received URL: ${url}`);
+      
+      cfg.gifUrl = url;
+      cfg.gifFileId = null;
+      cfg.gifChatId = chatId;
+      cfg.gifValid = true; // URLs don't need validation
+      await setChat(chatId, cfg);
+      pendingGif.delete(chatId);
+      
+      await bot.sendMessage(chatId, 
+        `✅ GIF URL saved!\nWill use this animation for every buy alert.`, 
+        { ...opts }
+      );
+    } else {
+      await bot.sendMessage(chatId, 
+        '❌ Please send an animation/GIF file or a direct GIF URL.', 
+        { ...opts }
+      );
+    }
     return;
   }
 
+  // Handle other text inputs
   if (!msg.text) return;
 
   if (awaitingTokenInput.has(chatId)) {
@@ -634,6 +749,8 @@ bot.on('message', async (msg) => {
   }
 });
 
+// -------- REMOVED: Duplicate animation handler - now handled in main message handler
+
 // -------- Backward-compatible commands --------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -689,31 +806,27 @@ bot.onText(/\/setgif(?: (https?:\/\/\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
+  
   if (match[1]) {
+    // URL provided
     cfg.gifUrl = match[1];
     cfg.gifFileId = null;
-    cfg.gifChatId = null;
+    cfg.gifChatId = chatId;
+    cfg.gifValid = true;
     await setChat(chatId, cfg);
     await bot.sendMessage(chatId, '✅ GIF URL set.', { ...opts });
   } else {
+    // Wait for animation
     pendingGif.set(chatId, true);
-    await bot.sendMessage(chatId, '📎 Send the GIF/animation you want to use for alerts.', { ...opts });
+    await bot.sendMessage(chatId, 
+      '📎 Send the GIF/animation you want to use for alerts (as an animation, max 50MB).\n' +
+      'Or send a direct GIF URL in your next message.', 
+      { ...opts }
+    );
   }
 });
 
-bot.on('animation', async (msg) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  if (!pendingGif.get(chatId)) return;
-  cfg.gifFileId = msg.animation.file_id;
-  cfg.gifUrl = null;
-  cfg.gifChatId = chatId;
-  await setChat(chatId, cfg);
-  pendingGif.delete(chatId);
-  await bot.sendMessage(chatId, '✅ GIF saved! Will play on every buy alert in this chat.', { ...opts });
-});
-
+// -------- Updated commands with better GIF handling
 bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
@@ -751,13 +864,15 @@ bot.onText(/\/status/, async (msg) => {
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
+  const gifStatus = cfg.gifFileId ? (cfg.gifValid ? `✅ custom set (chat ${cfg.gifChatId})` : `⚠️ invalid file (chat ${cfg.gifChatId})`) : 
+                   (cfg.gifUrl ? `🔗 ${cfg.gifUrl}` : '❌ none');
   const statusText =
     `<b>Current Config</b>\n` +
     `Pools:\n${pools}\n\n` +
     `Min Buy: $${cfg.minBuyUsd}\n` +
     `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
     `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
-    `GIF: ${cfg.gifFileId ? `✅ custom set (chat ${cfg.gifChatId})` : (cfg.gifUrl ? cfg.gifUrl : '❌ none')}\n` +
+    `GIF: ${gifStatus}\n` +
     `Thread ID: ${cfg.threadId ? cfg.threadId : 'None'}\n` +
     `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
   await bot.sendMessage(chatId, statusText, { parse_mode: 'HTML', ...opts });
@@ -980,29 +1095,27 @@ async function broadcastTrade(pool, trade) {
       (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
       `🔗 <a href="${txUrl}">TX</a>`;
 
-    await safeSend(chatId, async (opts) => {
-      if (cfg.gifFileId && cfg.gifChatId === chatId) {
-        await bot.sendAnimation(chatId, cfg.gifFileId, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-          message_thread_id: cfg.threadId || undefined,
-          caption,
-          reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
-        });
-      } else if (cfg.gifUrl) {
-        await bot.sendAnimation(chatId, cfg.gifUrl, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-          message_thread_id: cfg.threadId || undefined,
-          caption,
-          reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
-        });
-      } else {
+    const replyMarkup = { 
+      inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] 
+    };
+
+    // FIXED: Use safe GIF sender with fallback
+    await safeSend(chatId, async (sendOpts) => {
+      const usedGif = await safeSendGif(
+        chatId, 
+        cfg, 
+        caption, 
+        replyMarkup, 
+        cfg.threadId
+      );
+      
+      if (!usedGif) {
+        // Fallback to text message
         await bot.sendMessage(chatId, caption, {
           parse_mode: 'HTML',
           disable_web_page_preview: true,
           message_thread_id: cfg.threadId || undefined,
-          reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] }
+          reply_markup: replyMarkup
         });
       }
     });
