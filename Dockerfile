@@ -1,7 +1,18 @@
-FROM node:20-alpine
+# Use a pinned Node version (stable + Railway-friendly)
+FROM node:20.11.1-alpine AS base
+
+# Set working directory
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm i --omit=dev
+
+# Install only prod dependencies
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy app code
 COPY . .
+
+# Set environment
 ENV NODE_ENV=production
-CMD ["npm","start"]
+
+# Start bot
+CMD ["npm", "start"]
