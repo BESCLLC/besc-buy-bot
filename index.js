@@ -7,15 +7,13 @@ import PQueue from 'p-queue';
 
 const {
   TELEGRAM_TOKEN,
-  SUBGRAPH_URL,
-  EXPLORER_TX_URL = 'https://explorer.beschyperchain.com/tx/',
   GECKO_NETWORK = 'besc-hyperchain',
+  EXPLORER_TX_URL = 'https://explorer.beschyperchain.com/tx/',
   REDIS_URL,
   POLL_INTERVAL_MS = '400'
 } = process.env;
 
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
-if (!SUBGRAPH_URL) throw new Error('Missing SUBGRAPH_URL');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
@@ -26,7 +24,10 @@ app.get('/healthz', (_, res) => res.send('ok'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Health server on :' + PORT));
 
+const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const memoryStore = new Map();
+
+// State maps for inline flows
 const pendingVideo = new Map();
 const awaitingTokenInput = new Map();
 const awaitingMinBuyInput = new Map();
@@ -34,7 +35,7 @@ const awaitingTierInput = new Map();
 const awaitingRemoveChoice = new Map();
 const compWizard = new Map();
 
-// Global error handler
+// Global error handler to prevent crashes
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
@@ -78,7 +79,7 @@ function tierEmoji(cfg, usd) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function formatUSD(n, maxFraction = 0) {
@@ -108,152 +109,60 @@ function adjustSupply(supplyLike, decimals = 18) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// -------- Subgraph Queries --------
-async function fetchTopPoolForToken(tokenAddr) {
-  const query = `
-  {
-    pairs(
-      first: 1
-      orderBy: reserveUSD
-      orderDirection: desc
-      where: {
-        or: [
-          { token0: "${tokenAddr.toLowerCase()}" }
-          { token1: "${tokenAddr.toLowerCase()}" }
-        ]
-      }
-    ) {
-      id
-      token0 { id symbol decimals }
-      token1 { id symbol decimals }
-      reserveUSD
-    }
-  }`;
-
-  try {
-    const { data } = await axios.post(process.env.SUBGRAPH_URL, { query });
-    const pairs = data?.data?.pairs || [];
-    if (!pairs.length) return null;
-
-    const pair = pairs[0];
-    const symbol = pair.token0.id.toLowerCase() === tokenAddr.toLowerCase()
-      ? pair.token0.symbol
-      : pair.token1.symbol;
-    const decimals = pair.token0.id.toLowerCase() === tokenAddr.toLowerCase()
-      ? pair.token0.decimals
-      : pair.token1.decimals;
-
-    return { pool: pair.id, symbol, decimals };
-  } catch (e) {
-    console.error(`[Subgraph] Failed to fetch pool for ${tokenAddr}:`, e.message);
-    return null;
-  }
-}
-
-async function fetchTradesForPool(pairAddr) {
-  const query = `
-  {
-    swaps(
-      first: 5
-      orderBy: timestamp
-      orderDirection: desc
-      where: { pair: "${pairAddr.toLowerCase()}" }
-    ) {
-      id
-      transaction { id }
-      sender
-      to
-      pair {
-        token0 { symbol id decimals }
-        token1 { symbol id decimals }
-      }
-      amount0In
-      amount1In
-      amount0Out
-      amount1Out
-      timestamp
-    }
-  }`;
-
-  try {
-    const { data } = await axios.post(process.env.SUBGRAPH_URL, { query });
-    return data?.data?.swaps || [];
-  } catch (e) {
-    console.error(`[Subgraph] Failed for pair ${pairAddr}:`, e.message);
-    return [];
-  }
-}
-
-async function fetchPairStats(pairAddr) {
-  const query = `
-  {
-    pairDayDatas(
-      first: 1
-      orderBy: date
-      orderDirection: desc
-      where: { pair: "${pairAddr.toLowerCase()}" }
-    ) {
-      reserveUSD
-      dailyVolumeUSD
-      token0Price
-      token1Price
-    }
-  }`;
-
-  try {
-    const { data } = await axios.post(process.env.SUBGRAPH_URL, { query });
-    return data?.data?.pairDayDatas[0] || {};
-  } catch (e) {
-    console.error(`[Subgraph] Failed to fetch pair stats for ${pairAddr}:`, e.message);
-    return {};
-  }
-}
-
-// -------- Video validation --------
+// -------- FIXED: Robust Video validation helper --------
 async function validateVideoFileId(chatId, fileId) {
   try {
     console.log(`[VIDEO] Attempting to validate file_id: ${fileId}`);
     const file = await bot.getFile(fileId);
-    console.log(`[VIDEO] File info:`, {
+    
+    console.log(`[VIDEO] File info for ${fileId}:`, {
       file_path: file.file_path,
       file_size: file.file_size,
       mime_type: file.mime_type,
       file_unique_id: file.file_unique_id
     });
-
+    
+    // Basic checks
     if (!file.file_path) {
       console.warn(`[VIDEO] No file_path for ${fileId}`);
       return false;
     }
-
+    
     if (file.file_size >= 50 * 1024 * 1024) {
       console.warn(`[VIDEO] File too large: ${file.file_size} bytes`);
       return false;
     }
-
-    const isVideo = file.mime_type?.startsWith('video/') ||
-                    file.file_path?.includes('.mp4') ||
-                    file.file_path?.includes('.mov') ||
-                    file.file_path?.includes('.avi') ||
-                    file.mime_type === 'application/octet-stream';
-
+    
+    // More lenient MIME type check - accept various video formats
+    const isVideo = file.mime_type?.startsWith('video/') || 
+                   file.file_path?.includes('.mp4') || 
+                   file.file_path?.includes('.mov') ||
+                   file.file_path?.includes('.avi') ||
+                   file.mime_type === 'application/octet-stream'; // Telegram sometimes uses this for videos
+    
     if (!isVideo) {
       console.warn(`[VIDEO] Not recognized as video: mime=${file.mime_type}, path=${file.file_path}`);
-      return true; // Lenient mode
+      // Still accept it - better to be permissive than strict
+      console.log(`[VIDEO] Accepting file anyway (lenient mode)`);
+      return true;
     }
-
-    console.log(`[VIDEO] ✅ Validated file_id ${fileId} for chat ${chatId}`);
+    
+    console.log(`[VIDEO] ✅ Validated file_id ${fileId} for chat ${chatId}: ${file.file_path} (${file.file_size} bytes)`);
     return true;
+    
   } catch (error) {
     console.error(`[VIDEO] Failed to validate file_id ${fileId}:`, error.message);
-    return true; // Lenient mode
+    // Be extra lenient - if validation fails, still accept the file
+    console.log(`[VIDEO] Accepting file despite validation error (lenient mode)`);
+    return true;
   }
 }
 
 // -------- Safe video sender --------
 async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId) {
   const { videoFileId, videoUrl, videoValid } = videoConfig;
-
+  
+  // Try URL first (most reliable for videos)
   if (videoUrl) {
     try {
       console.log(`[VIDEO] Sending URL video: ${videoUrl}`);
@@ -270,8 +179,9 @@ async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId
       console.warn(`[VIDEO] URL video failed: ${urlError.message}`);
     }
   }
-
-  if (videoFileId && videoValid !== false) {
+  
+  // Try file_id if valid
+  if (videoFileId && videoValid !== false) { // Changed: allow if not explicitly invalid
     try {
       console.log(`[VIDEO] Sending file_id video: ${videoFileId}`);
       await bot.sendVideo(chatId, videoFileId, {
@@ -285,26 +195,95 @@ async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId
       return true;
     } catch (fileError) {
       console.error(`[VIDEO] File_id video failed: ${fileError.message}`);
+      console.error(`[VIDEO] Full error:`, fileError);
+      // Mark invalid and fallback
       const cfg = await getChat(chatId);
       cfg.videoValid = false;
       await setChat(chatId, cfg);
       console.log(`[VIDEO] Marked video as invalid for chat ${chatId}`);
     }
   }
-
+  
+  // Fallback to text
   console.log(`[VIDEO] Falling back to text for chat ${chatId}`);
   return false;
 }
 
-// -------- Settings Panel --------
+// -------- GeckoTerminal wrappers --------
+async function fetchTopPoolForToken(tokenAddr) {
+  const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
+  try {
+    const { data } = await axios.get(url, {
+      headers: { 'Accept': 'application/json;version=20230302' }
+    });
+    const pools = data?.data?.relationships?.top_pools?.data || [];
+    if (!pools.length) return null;
+    const poolId = pools[0].id;
+    const pool = poolId.split('_').pop(); // Strip network prefix
+    const symbol = data?.data?.attributes?.symbol || 'TOKEN';
+    return { pool, symbol };
+  } catch (e) {
+    console.error(`[GeckoTerminal] Failed to fetch top pool for ${tokenAddr}:`, e.message);
+    return null;
+  }
+}
+
+async function fetchTradesForPool(pool) {
+  try {
+    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
+    const { data } = await axios.get(url, {
+      headers: { 'Accept': 'application/json;version=20230302' }
+    });
+    return normalizeTrades(data?.data);
+  } catch (e) {
+    console.error(`[GeckoTerminal] Failed for pool ${pool}:`, e.response?.status, e.response?.data || e.message);
+    if (e.response?.status === 404) {
+      // Notify chats tracking this pool
+      const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
+      for (const k of keys) {
+        const chatId = Number(k.split(':')[1]);
+        const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
+        if (cfg?.pools.includes(pool)) {
+          await safeSend(chatId, async (opts) => {
+            await bot.sendMessage(chatId, `⚠️ Pool ${pool} not found on network ${GECKO_NETWORK}. Please remove and re-add the token with /add.`, { ...opts });
+          });
+        }
+      }
+    }
+    return [];
+  }
+}
+
+function normalizeTrades(items) {
+  return (items || []).map(x => {
+    const a = x.attributes || {};
+    const kind = (a.kind || '').toLowerCase();
+    const isSell = kind === 'sell';
+    const tokenAmount = Number(isSell ? a.from_token_amount : a.to_token_amount);
+    return {
+      id: x.id,
+      tx: a.tx_hash,
+      priceUsd: Number(a.price_to_in_usd ?? a.price_from_in_usd ?? 0),
+      amountUsd: Number(a.volume_in_usd ?? 0),
+      amountToken: tokenAmount,
+      tradeType: kind,
+      buyer: a.tx_from_address || null,
+      fromToken: a.from_token_address,
+      toToken: a.to_token_address,
+      ts: a.block_timestamp
+    }
+  });
+}
+
+// -------- Inline Settings Panel --------
 async function sendSettingsPanel(chatId, messageId = null) {
   const cfg = await getChat(chatId);
   const tokens = cfg.pools.length
     ? cfg.pools.map(p => cfg.tokenSymbols[p] || (p.slice(0,6)+'…'+p.slice(-4))).join(', ')
     : 'None';
-  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? '✅ valid' : '⚠️ invalid') :
+  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? '✅ valid' : '⚠️ invalid') : 
                      (cfg.videoUrl ? '🔗 URL' : '❌ none');
-
+  
   const text =
     `⚙️ <b>Settings Panel</b>\n` +
     `<b>Tracking:</b> ${escapeHtml(tokens)}\n` +
@@ -338,19 +317,19 @@ async function sendSettingsPanel(chatId, messageId = null) {
 
   try {
     if (messageId) {
-      await bot.editMessageText(text, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-        ...opts
+      await bot.editMessageText(text, { 
+        chat_id: chatId, 
+        message_id: messageId, 
+        parse_mode: 'HTML', 
+        reply_markup: keyboard, 
+        ...opts 
       });
     } else {
       await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
     }
   } catch (error) {
     if (error.message.includes("message can't be edited") || error.message.includes("message thread not found")) {
-      console.warn(`[WARN] Could not edit/send settings panel for chat ${chatId}. Sending new message.`);
+      console.warn(`[WARN] Could not edit/send settings panel for chat ${chatId} (invalid message or thread). Sending new message.`);
       try {
         if (messageId) await bot.deleteMessage(chatId, messageId, { ...opts });
       } catch (deleteErr) {
@@ -531,7 +510,7 @@ bot.on('callback_query', async (query) => {
             console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
             await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
           }
-          await bot.sendMessage(chatId,
+          await bot.sendMessage(chatId, 
             `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
             {
               parse_mode: 'HTML',
@@ -569,7 +548,7 @@ bot.on('callback_query', async (query) => {
 
     case 'set_video':
       pendingVideo.set(chatId, true);
-      await bot.sendMessage(chatId,
+      await bot.sendMessage(chatId, 
         '📹 Send the video (MP4, max 50MB) you want to use for alerts.\n' +
         'Or reply with a direct MP4 URL.', 
         { ...opts }
@@ -643,19 +622,22 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// -------- Message Handler --------
+// -------- FIXED: Single Message Handler with Robust Video Handling --------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
 
-  if (msg.text && msg.text.startsWith('/')) return;
+  if (msg.text && msg.text.startsWith('/')) {
+    return;
+  }
 
+  // FIXED: Handle video setting with robust validation
   if (pendingVideo.has(chatId)) {
     if (msg.video || (msg.document && msg.document.mime_type?.startsWith('video/'))) {
       let fileId;
       let fileInfo = {};
-
+      
       if (msg.video) {
         fileId = msg.video.file_id;
         fileInfo = {
@@ -677,26 +659,30 @@ bot.on('message', async (msg) => {
           file_name: msg.document.file_name
         };
       }
-
+      
       console.log(`[VIDEO] Received video info:`, fileInfo);
+      
+      // Validate the file (but be lenient)
       const isValid = await validateVideoFileId(chatId, fileId);
-
+      
+      // Save regardless - validation failures won't break it
       cfg.videoFileId = fileId;
       cfg.videoUrl = null;
       cfg.videoChatId = chatId;
       cfg.videoValid = isValid;
       await setChat(chatId, cfg);
       pendingVideo.delete(chatId);
-
+      
       const status = isValid ? '✅ Video saved and validated!' : '⚠️ Video saved (validation warning - will try anyway)';
-      await bot.sendMessage(chatId,
+      await bot.sendMessage(chatId, 
         `${status}\nWill play on every buy alert in this chat.\n\n` +
         `File ID: \`${fileId}\`\n` +
         `Size: ${fileInfo.file_size || 'unknown'} bytes\n` +
         `Type: ${fileInfo.type}`, 
         { parse_mode: 'HTML', ...opts }
       );
-
+      
+      // Test send immediately to verify
       setTimeout(async () => {
         try {
           await bot.sendVideo(chatId, fileId, {
@@ -710,30 +696,32 @@ bot.on('message', async (msg) => {
           const cfg2 = await getChat(chatId);
           cfg2.videoValid = false;
           await setChat(chatId, cfg2);
-          await bot.sendMessage(chatId,
-            `⚠️ Test send failed - video marked invalid. Use /removevideo and try again.`,
+          await bot.sendMessage(chatId, 
+            `⚠️ Test send failed - video marked invalid. Use /removevideo and try again.`, 
             { ...opts }
           );
         }
-      }, 3000);
+      }, 3000); // Wait 3 seconds before test
+      
     } else if (msg.text && msg.text.startsWith('http')) {
+      // Handle URL
       const url = msg.text.trim();
       console.log(`[VIDEO] Received URL: ${url}`);
-
+      
       cfg.videoUrl = url;
       cfg.videoFileId = null;
       cfg.videoChatId = chatId;
       cfg.videoValid = true;
       await setChat(chatId, cfg);
       pendingVideo.delete(chatId);
-
-      await bot.sendMessage(chatId,
-        `✅ Video URL saved!\nWill use this MP4 for every buy alert.`,
+      
+      await bot.sendMessage(chatId, 
+        `✅ Video URL saved!\nWill use this MP4 for every buy alert.`, 
         { ...opts }
       );
     } else {
-      await bot.sendMessage(chatId,
-        '❌ Please send a video file (MP4) or a direct MP4 URL.',
+      await bot.sendMessage(chatId, 
+        '❌ Please send a video file (MP4) or a direct MP4 URL.', 
         { ...opts }
       );
     }
@@ -761,7 +749,7 @@ bot.on('message', async (msg) => {
       await bot.sendMessage(chatId, `✅ Tracking ${top.symbol} (${top.pool.slice(0,6)}…${top.pool.slice(-4)})`, { ...opts });
       await sendSettingsPanel(chatId, msgId);
     } else {
-      await bot.sendMessage(chatId, '❌ No pool found for that token.', { ...opts });
+      await bot.sendMessage(chatId, '❌ No pool found for that token on this network.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
     }
     return;
@@ -842,24 +830,25 @@ bot.on('message', async (msg) => {
   }
 });
 
-// -------- Commands --------
+// -------- Video Test Command --------
 bot.onText(/\/testvideo (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const opts = { message_thread_id: (await getChat(chatId)).threadId || undefined };
   const fileId = match[1].trim();
-
+  
   if (!fileId) {
     return bot.sendMessage(chatId, 'Usage: /testvideo <file_id>', { ...opts });
   }
-
+  
   const isValid = await validateVideoFileId(chatId, fileId);
-  await bot.sendMessage(chatId,
+  await bot.sendMessage(chatId, 
     `Video validation result for ${fileId}:\n` +
     `Status: ${isValid ? '✅ VALID' : '❌ INVALID'}\n` +
-    `Chat: ${chatId}`,
+    `Chat: ${chatId}`, 
     { ...opts }
   );
-
+  
+  // Try to send test
   try {
     await bot.sendVideo(chatId, fileId, {
       caption: '🧪 Test video - if you see this, video works!',
@@ -868,20 +857,21 @@ bot.onText(/\/testvideo (.+)/, async (msg, match) => {
     });
     await bot.sendMessage(chatId, `✅ Test send successful!`, { ...opts });
   } catch (testError) {
-    await bot.sendMessage(chatId,
-      `❌ Test send failed: ${testError.message}`,
+    await bot.sendMessage(chatId, 
+      `❌ Test send failed: ${testError.message}`, 
       { ...opts }
     );
   }
 });
 
+// -------- Backward-compatible commands --------
 bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
   const token = match[1];
   const top = await fetchTopPoolForToken(token);
-  if (!top) return bot.sendMessage(chatId, '❌ No pool found for that token.', { ...opts });
+  if (!top) return bot.sendMessage(chatId, '❌ No pool found for that token on this network.', { ...opts });
   if (!cfg.pools.includes(top.pool)) cfg.pools.push(top.pool);
   cfg.tokenSymbols[top.pool] = top.symbol || 'TOKEN';
   await setChat(chatId, cfg);
@@ -929,8 +919,9 @@ bot.onText(/\/setvideo(?: (https?:\/\/\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
-
+  
   if (match[1]) {
+    // URL provided
     cfg.videoUrl = match[1];
     cfg.videoFileId = null;
     cfg.videoChatId = chatId;
@@ -938,10 +929,11 @@ bot.onText(/\/setvideo(?: (https?:\/\/\S+))?$/, async (msg, match) => {
     await setChat(chatId, cfg);
     await bot.sendMessage(chatId, '✅ Video URL set.', { ...opts });
   } else {
+    // Wait for video
     pendingVideo.set(chatId, true);
-    await bot.sendMessage(chatId,
+    await bot.sendMessage(chatId, 
       '📹 Send the MP4 video (max 50MB) for alerts.\n' +
-      'Or send a direct MP4 URL next.',
+      'Or send a direct MP4 URL next.', 
       { ...opts }
     );
   }
@@ -984,7 +976,7 @@ bot.onText(/\/status/, async (msg) => {
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
-  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? `✅ custom set (chat ${cfg.videoChatId})` : `⚠️ invalid file (chat ${cfg.videoChatId})`) :
+  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? `✅ custom set (chat ${cfg.videoChatId})` : `⚠️ invalid file (chat ${cfg.videoChatId})`) : 
                      (cfg.videoUrl ? `🔗 ${cfg.videoUrl}` : '❌ none');
   const statusText =
     `<b>Current Config</b>\n` +
@@ -1046,11 +1038,13 @@ async function refreshPoolSet() {
       : [...memoryStore.keys()].map(k => `chat:${k}:config`);
 
     const set = new Set();
+
     console.log(`[DEBUG] refreshPoolSet found ${keys.length} chat configs`);
 
     for (const k of keys) {
       const chatId = Number(k.split(':')[1]);
       let cfg;
+
       try {
         cfg = redis ? JSON.parse(await redis.get(k) || '{}') : memoryStore.get(chatId);
       } catch (err) {
@@ -1076,11 +1070,13 @@ async function refreshPoolSet() {
 
     poolRoundRobin = Array.from(set);
     console.log(`[INFO] poolRoundRobin now has ${poolRoundRobin.length} pools:`, poolRoundRobin);
+
   } catch (e) {
     console.error(`[ERROR] refreshPoolSet failed:`, e.message);
   }
 }
 
+// Call once at startup, then every 10s
 refreshPoolSet();
 setInterval(refreshPoolSet, 10000);
 
@@ -1102,16 +1098,16 @@ async function safeSend(chatId, sendFn) {
   } catch (e) {
     const desc = e.response?.body?.description || '';
     if (desc.includes('kicked') || desc.includes('forbidden') || desc.includes('group chat was upgraded to a supergroup chat')) {
-      console.log(`[INFO] Chat ${chatId} is invalid. Cleaning config.`);
+      console.log(`[INFO] Chat ${chatId} is invalid (kicked, forbidden, or upgraded to supergroup). Cleaning config.`);
       if (redis) await redis.del(`chat:${chatId}:config`);
       else memoryStore.delete(chatId);
       try {
-        await bot.sendMessage(chatId, '⚠️ Chat was upgraded or bot removed. Please run /settings to reconfigure.', {});
+        await bot.sendMessage(chatId, '⚠️ Chat was upgraded to a supergroup or the bot was removed. Please run /settings to reconfigure.', {});
       } catch (notifyErr) {
-        console.warn(`[WARN] Could not notify chat ${chatId}:`, notifyErr.message);
+        console.warn(`[WARN] Could not notify chat ${chatId} about upgrade:`, notifyErr.message);
       }
     } else if (desc.includes('file_id') || desc.includes('not found') || desc.includes('message thread not found')) {
-      console.warn(`[WARN] Invalid operation for chat ${chatId}. Falling back.`);
+      console.warn(`[WARN] Invalid operation for chat ${chatId} (video file_id or thread not found). Falling back.`);
       const cfg = await getChat(chatId);
       if (desc.includes('message thread not found')) {
         cfg.threadId = null;
@@ -1120,7 +1116,7 @@ async function safeSend(chatId, sendFn) {
         try {
           await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
         } catch (notifyErr) {
-          console.warn(`[WARN] Could not notify chat ${chatId}:`, notifyErr.message);
+          console.warn(`[WARN] Could not notify chat ${chatId} about invalid topic:`, notifyErr.message);
         }
       }
       await sendFn({});
@@ -1138,55 +1134,95 @@ async function broadcastTrade(pool, trade) {
     if (!cfg || !cfg.pools.includes(pool)) continue;
     if (trade.tradeType === 'sell' && cfg.showSells === false) continue;
 
-    const stats = await fetchPairStats(pool);
-    const isToken0WBESC = trade.pair.token0.id.toLowerCase() === '0x33e22F85CC1877697773ca5c85988663388883A0'.toLowerCase(); // Replace with actual WBESC address
-    const price = isToken0WBESC ? stats.token1Price : stats.token0Price;
-    const amountTok = adjustSupply(isToken0WBESC ? (trade.amount1Out || trade.amount1In) : (trade.amount0Out || trade.amount0In), trade.pair[isToken0WBESC ? 'token1' : 'token0'].decimals);
-    const usd = price && amountTok ? Number(price) * Number(amountTok) : 0;
-
+    const usd = Number(trade.amountUsd || 0);
     if (usd < (cfg.minBuyUsd || 0)) continue;
 
     if (cfg.activeCompetition) {
-      cfg.activeCompetition.leaderboard[trade.sender || trade.transaction.id] =
-        (cfg.activeCompetition.leaderboard[trade.sender || trade.transaction.id] || 0) + usd;
+      cfg.activeCompetition.leaderboard[trade.buyer || trade.tx] =
+        (cfg.activeCompetition.leaderboard[trade.buyer || trade.tx] || 0) + usd;
       await setChat(chatId, cfg);
     }
 
     let extraData = '';
-    if (stats.reserveUSD) extraData += `💧 Liquidity: $${formatUSD(Number(stats.reserveUSD))}\n`;
-    if (stats.dailyVolumeUSD) extraData += `📈 24h Vol: $${formatUSD(Number(stats.dailyVolumeUSD))}\n`;
-    if (price) extraData += `💹 Price: $${formatUSD(Number(price), 6)}\n`;
+    try {
+      const tokenAddr = trade.toToken || trade.fromToken;
+      if (tokenAddr) {
+        const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
+        const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
+        const [tokenRes, poolRes] = await Promise.all([
+          axios.get(tokenUrl, { headers: { 'Accept': 'application/json;version=20230302' } }),
+          axios.get(poolUrl, { headers: { 'Accept': 'application/json;version=20230302' } })
+        ]);
+
+        const tokenAttr = tokenRes?.data?.data?.attributes || {};
+        const poolAttr = poolRes?.data?.data?.attributes || {};
+        const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
+
+        let mcLabel = 'MC';
+        let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
+        if (!mcValue && price > 0) {
+          const circ = adjustSupply(tokenAttr.circulating_supply, tokenAttr.decimals ?? 18);
+          if (circ > 0) mcValue = circ * price;
+          else if (tokenAttr.fdv_usd) {
+            mcValue = Number(tokenAttr.fdv_usd);
+            mcLabel = 'FDV';
+          } else {
+            const total = adjustSupply(tokenAttr.total_supply, tokenAttr.decimals ?? 18);
+            if (total > 0) {
+              mcValue = total * price;
+              mcLabel = 'FDV';
+            }
+          }
+        }
+
+        if (mcValue && mcValue > 0) extraData += `📊 ${mcLabel}: $${formatUSD(mcValue)}\n`;
+        if (poolAttr.reserve_in_usd) extraData += `💧 Liquidity: $${formatUSD(Number(poolAttr.reserve_in_usd))}\n`;
+        if (poolAttr.volume_usd_24h) extraData += `📈 24h Vol: $${formatUSD(Number(poolAttr.volume_usd_24h))}\n`;
+        if (tokenAttr.price_percent_change_24h != null) {
+          const pct = Number(tokenAttr.price_percent_change_24h);
+          if (Number.isFinite(pct)) extraData += `📊 24h Change: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%\n`;
+        }
+        if (tokenAttr.unique_wallet_count) {
+          extraData += `👥 Holders: ${tokenAttr.unique_wallet_count}\n`;
+        }
+      }
+    } catch (e) {
+      console.warn(`[DEBUG] Extra data fetch failed:`, e.message);
+    }
 
     const isSell = trade.tradeType === 'sell';
     const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
     const action = isSell ? 'SELL' : 'BUY';
-    const symbol = cfg.tokenSymbols[pool] || trade.pair.token0.symbol || trade.pair.token1.symbol || 'TOKEN';
-    const priceStr = price ? `$${formatUSD(Number(price), 6)}` : '—';
-    const txUrl = `${EXPLORER_TX_URL}${trade.transaction.id}`;
+    const symbol = cfg.tokenSymbols[pool] || 'TOKEN';
+    const priceStr = trade.priceUsd ? `$${trade.priceUsd.toFixed(6)}` : '—';
+    const amountTok = trade.amountToken ? trade.amountToken.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
+    const txUrl = EXPLORER_TX_URL + trade.tx;
     const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${pool}`;
 
     const caption =
       `${emoji} <b>${action}</b> • <b>${escapeHtml(symbol)}</b>\n` +
       `💵 <b>$${usd.toFixed(2)}</b>\n` +
-      `🧮 ${amountTok.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${escapeHtml(symbol)} @ ${priceStr}\n` +
+      `🧮 ${amountTok} ${escapeHtml(symbol)} @ ${priceStr}\n` +
       extraData +
-      (trade.sender ? `👤 ${escapeHtml(trade.sender.slice(0,6))}…${escapeHtml(trade.sender.slice(-4))}\n` : '') +
-      `🔗 <a href="${txUrl}">TX</a> | <a href="${chart}">Chart</a>`;
+      (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
+      `🔗 <a href="${txUrl}">TX</a>`;
 
-    const replyMarkup = {
-      inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]]
+    const replyMarkup = { 
+      inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] 
     };
 
+    // Use safe video sender with fallback
     await safeSend(chatId, async (sendOpts) => {
       const usedVideo = await safeSendVideo(
-        chatId,
-        cfg,
-        caption,
-        replyMarkup,
+        chatId, 
+        cfg, 
+        caption, 
+        replyMarkup, 
         cfg.threadId
       );
-
+      
       if (!usedVideo) {
+        // Fallback to text message
         await bot.sendMessage(chatId, caption, {
           parse_mode: 'HTML',
           disable_web_page_preview: true,
@@ -1206,19 +1242,8 @@ async function tickOnce() {
   if (!trades.length) return;
   const latest = trades[0];
   if (latest?.id && await seen(pool, latest.id)) return;
-
-  if (latest?.id) {
-    const isBuy =
-      (latest.pair.token0.symbol === "WBESC" && Number(latest.amount0Out) > 0) ||
-      (latest.pair.token1.symbol === "WBESC" && Number(latest.amount1Out) > 0);
-    const isSell =
-      (latest.pair.token0.symbol === "WBESC" && Number(latest.amount0In) > 0) ||
-      (latest.pair.token1.symbol === "WBESC" && Number(latest.amount1In) > 0);
-
-    latest.tradeType = isBuy ? "buy" : isSell ? "sell" : "other";
-    await broadcastTrade(pool, latest);
-  }
+  if (latest?.id) await broadcastTrade(pool, latest);
 }
 
 setInterval(() => queue.add(tickOnce).catch(console.error), Number(POLL_INTERVAL_MS));
-console.log('Buy bot started with Subgraph:', SUBGRAPH_URL, 'and GeckoTerminal charts:', GECKO_NETWORK);
+console.log('Buy bot started on network:', GECKO_NETWORK);
