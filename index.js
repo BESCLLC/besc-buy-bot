@@ -4,15 +4,13 @@ import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import Redis from 'ioredis';
 import PQueue from 'p-queue';
-import { ethers } from 'ethers';
 
 const {
   TELEGRAM_TOKEN,
   GECKO_NETWORK = 'besc-hyperchain',
   EXPLORER_TX_URL = 'https://explorer.beschyperchain.com/tx/',
   REDIS_URL,
-  POLL_INTERVAL_MS = '400',
-  RPC_WS_URL = 'wss://rpc.beschyperchain.com/ws'
+  POLL_INTERVAL_MS = '100'
 } = process.env;
 
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
@@ -36,10 +34,6 @@ const awaitingMinBuyInput = new Map();
 const awaitingTierInput = new Map();
 const awaitingRemoveChoice = new Map();
 const compWizard = new Map();
-
-// WS Provider and Subscriptions
-let provider = null;
-const subscriptions = new Map();
 
 // Global error handler to prevent crashes
 process.on('uncaughtException', (err) => {
@@ -685,7 +679,7 @@ bot.on('message', async (msg) => {
         `File ID: \`${fileId}\`\n` +
         `Size: ${fileInfo.file_size || 'unknown'} bytes\n` +
         `Type: ${fileInfo.type}`, 
-        { parse_mode: 'Markdown', ...opts }
+        { parse_mode: 'HTML', ...opts }
       );
       
       // Test send immediately to verify
@@ -984,7 +978,6 @@ bot.onText(/\/status/, async (msg) => {
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
   const videoStatus = cfg.videoFileId ? (cfg.videoValid ? `✅ custom set (chat ${cfg.videoChatId})` : `⚠️ invalid file (chat ${cfg.videoChatId})`) : 
                      (cfg.videoUrl ? `🔗 ${cfg.videoUrl}` : '❌ none');
-  const wsStatus = provider ? 'Connected' : 'Disconnected (using fallback)';
   const statusText =
     `<b>Current Config</b>\n` +
     `Pools:\n${pools}\n\n` +
@@ -993,7 +986,6 @@ bot.onText(/\/status/, async (msg) => {
     `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
     `Video: ${videoStatus}\n` +
     `Thread ID: ${cfg.threadId ? cfg.threadId : 'None'}\n` +
-    `WS Status: ${wsStatus}\n` +
     `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
   await bot.sendMessage(chatId, statusText, { parse_mode: 'HTML', ...opts });
 });
@@ -1078,7 +1070,6 @@ async function refreshPoolSet() {
 
     poolRoundRobin = Array.from(set);
     console.log(`[INFO] poolRoundRobin now has ${poolRoundRobin.length} pools:`, poolRoundRobin);
-    await manageSubscriptions();
 
   } catch (e) {
     console.error(`[ERROR] refreshPoolSet failed:`, e.message);
@@ -1243,128 +1234,6 @@ async function broadcastTrade(pool, trade) {
   }
 }
 
-// -------- WS Initialization --------
-function initProvider() {
-  try {
-    provider = new ethers.WebSocketProvider(RPC_WS_URL);
-    provider.websocket.on('open', () => {
-      console.log('[WS] Connected to BESC RPC');
-      manageSubscriptions(); // Resub on connect
-    });
-    provider.websocket.on('close', () => {
-      console.log('[WS] Disconnected; reconnecting in 5s...');
-      setTimeout(initProvider, 5000); // Auto-reconnect
-    });
-    provider.websocket.on('error', (err) => console.error('[WS] Error:', err.message));
-  } catch (e) {
-    console.error('[WS] Init failed:', e.message);
-    // Fallback to polling mode
-    setInterval(() => queue.add(tickOnce).catch(console.error), Number(POLL_INTERVAL_MS));
-  }
-}
-initProvider();
-
-// -------- Manage Subscriptions --------
-async function manageSubscriptions() {
-  if (!provider) return;
-  const currentPools = new Set(poolRoundRobin);
-  // Unsubscribe removed pools
-  for (const [pool, sub] of subscriptions.entries()) {
-    if (!currentPools.has(pool)) {
-      sub(); // Unsub
-      subscriptions.delete(pool);
-      console.log(`[WS] Unsubscribed from pool ${pool}`);
-    }
-  }
-  // Subscribe new pools
-  for (const pool of currentPools) {
-    if (!subscriptions.has(pool)) {
-      try {
-        const unsub = await subscribeToPool(pool);
-        subscriptions.set(pool, unsub);
-      } catch (e) {
-        console.error(`[WS] Sub failed for ${pool}:`, e.message);
-      }
-    }
-  }
-}
-
-// -------- Subscribe to Pool --------
-async function subscribeToPool(pool) {
-  const filter = {
-    address: pool.toLowerCase(),
-    topics: [['0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822']] // Swap topic0
-  };
-  const listener = async (log) => {
-    try {
-      const tradeId = log.transactionHash + '-' + log.logIndex;
-      if (await seen(pool, tradeId)) return; // Dedupe
-
-      const iface = new ethers.Interface([
-        'event Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to)'
-      ]);
-      const decoded = iface.parseLog(log);
-      if (!decoded) return;
-
-      const { sender, amount0In, amount1In, amount0Out, amount1Out, to } = decoded.args;
-
-      // Fetch pool data from Gecko
-      const poolData = await fetchPoolData(pool);
-
-      // Assume token0 = base, token1 = quote/token
-      const isBuy = amount0In > 0n && amount1Out > 0n; // Base in, token out = buy
-      const tradeType = isBuy ? 'buy' : 'sell';
-      const amountToken = Number(isBuy ? amount1Out : amount1In) / (10 ** poolData.token1.decimals);
-      const amountBase = Number(isBuy ? amount0In : amount0Out) / (10 ** poolData.token0.decimals);
-      const priceUsd = poolData.token1.priceUsd;
-      const amountUsd = amountBase * poolData.token0.priceUsd; // Base to USD
-
-      const trade = {
-        id: tradeId,
-        tx: log.transactionHash,
-        priceUsd,
-        amountUsd,
-        amountToken,
-        tradeType,
-        buyer: isBuy ? to : sender,
-        fromToken: isBuy ? poolData.token0.address : poolData.token1.address,
-        toToken: isBuy ? poolData.token1.address : poolData.token0.address,
-        ts: new Date().toISOString()
-      };
-
-      await broadcastTrade(pool, trade);
-    } catch (e) {
-      console.error('[WS] Event processing:', e.message);
-    }
-  };
-
-  provider.on(filter, listener);
-  console.log(`[WS] Subscribed to pool ${pool}`);
-  return () => provider.off(filter, listener);
-}
-
-// -------- Fetch Pool Data --------
-async function fetchPoolData(pool) {
-  const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
-  const { data } = await axios.get(url, { headers: { 'Accept': 'application/json;version=20230302' } });
-  const attr = data?.data?.attributes || {};
-  const rel = data?.data?.relationships || {};
-  // Decimals: Assume 18; for accuracy, could fetch token info
-  return {
-    token0: {
-      address: rel.base_token?.data?.id.split('_').pop(),
-      decimals: Number(attr.base_token_decimals || 18),
-      priceUsd: Number(attr.base_token_price_usd || 0)
-    },
-    token1: {
-      address: rel.quote_token?.data?.id.split('_').pop(),
-      decimals: Number(attr.quote_token_decimals || 18),
-      priceUsd: Number(attr.quote_token_price_usd || 0)
-    }
-  };
-}
-
-// -------- Fallback Polling (if WS fails) --------
 async function tickOnce() {
   if (!poolRoundRobin.length) return;
   const pool = poolRoundRobin.shift();
@@ -1376,4 +1245,5 @@ async function tickOnce() {
   if (latest?.id) await broadcastTrade(pool, latest);
 }
 
+setInterval(() => queue.add(tickOnce).catch(console.error), Number(POLL_INTERVAL_MS));
 console.log('Buy bot started on network:', GECKO_NETWORK);
