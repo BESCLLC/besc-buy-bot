@@ -1293,7 +1293,7 @@ async function manageSubscriptions() {
 async function subscribeToPool(pool) {
   const filter = {
     address: pool.toLowerCase(),
-    topics: [['0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822']] // Swap topic0 for Uniswap V2/PancakeSwap
+    topics: [['0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822']] // Swap topic0
   };
   const listener = async (log) => {
     try {
@@ -1317,7 +1317,7 @@ async function subscribeToPool(pool) {
       const amountToken = Number(isBuy ? amount1Out : amount1In) / (10 ** poolData.token1.decimals);
       const amountBase = Number(isBuy ? amount0In : amount0Out) / (10 ** poolData.token0.decimals);
       const priceUsd = poolData.token1.priceUsd;
-      const amountUsd = amountBase * poolData.token0.priceUsd;
+      const amountUsd = amountBase * poolData.token0.priceUsd; // Base to USD
 
       const trade = {
         id: tradeId,
