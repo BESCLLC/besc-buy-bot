@@ -19,10 +19,8 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
 
 /**
- * 🔥 RATE-LIMIT FIX:
- * Your old config could burst 5 GT requests per POLL_INTERVAL_MS and spam token+pool calls per chat.
- * We hard-cap GeckoTerminal to ~1 request/sec (safe), regardless of POLL_INTERVAL_MS.
- * This preserves your bot behavior (still checks frequently) but prevents API nukes.
+ * ✅ Hard cap GeckoTerminal calls regardless of POLL_INTERVAL_MS
+ * - 1 request/sec, sequential
  */
 const queue = new PQueue({
   interval: 1000,
@@ -55,6 +53,10 @@ process.on('uncaughtException', (err) => {
 // ---------- small helpers ----------
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function jitter(max = 250) {
+  return Math.floor(Math.random() * max);
 }
 
 // -------- Config helpers --------
@@ -96,7 +98,7 @@ function tierEmoji(cfg, usd) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function formatUSD(n, maxFraction = 0) {
@@ -139,7 +141,6 @@ async function validateVideoFileId(chatId, fileId) {
       file_unique_id: file.file_unique_id
     });
 
-    // Basic checks
     if (!file.file_path) {
       console.warn(`[VIDEO] No file_path for ${fileId}`);
       return false;
@@ -150,13 +151,12 @@ async function validateVideoFileId(chatId, fileId) {
       return false;
     }
 
-    // More lenient MIME type check - accept various video formats
     const isVideo =
       file.mime_type?.startsWith('video/') ||
       file.file_path?.includes('.mp4') ||
       file.file_path?.includes('.mov') ||
       file.file_path?.includes('.avi') ||
-      file.mime_type === 'application/octet-stream'; // Telegram sometimes uses this for videos
+      file.mime_type === 'application/octet-stream';
 
     if (!isVideo) {
       console.warn(`[VIDEO] Not recognized as video: mime=${file.mime_type}, path=${file.file_path}`);
@@ -178,7 +178,6 @@ async function validateVideoFileId(chatId, fileId) {
 async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId) {
   const { videoFileId, videoUrl, videoValid } = videoConfig;
 
-  // Try URL first (most reliable for videos)
   if (videoUrl) {
     try {
       console.log(`[VIDEO] Sending URL video: ${videoUrl}`);
@@ -196,7 +195,6 @@ async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId
     }
   }
 
-  // Try file_id if valid
   if (videoFileId && videoValid !== false) {
     try {
       console.log(`[VIDEO] Sending file_id video: ${videoFileId}`);
@@ -211,7 +209,6 @@ async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId
       return true;
     } catch (fileError) {
       console.error(`[VIDEO] File_id video failed: ${fileError.message}`);
-      console.error(`[VIDEO] Full error:`, fileError);
       const cfg = await getChat(chatId);
       cfg.videoValid = false;
       await setChat(chatId, cfg);
@@ -224,13 +221,16 @@ async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId
 }
 
 /**
- * ✅ GeckoTerminal hardening:
- * - in-memory TTL cache
- * - in-flight de-dupe (same URL only hits once even if multiple callers)
- * - gentle retry/backoff on 429 + transient errors
+ * ✅ GeckoTerminal hardening (FIXED):
+ * - In-memory TTL cache
+ * - In-flight de-dupe
+ * - 429 backoff with MIN delay (prevents 0ms spin)
+ * - Global cooldown (all requests pause after 429)
+ * - Retry caps (never infinite attempts)
  */
-const geckoCache = new Map();   // url -> { ts, ttl, data }
-const geckoInflight = new Map(); // url -> Promise
+const geckoCache = new Map();       // url -> { ts, ttl, data }
+const geckoInflight = new Map();    // url -> Promise
+let geckoGlobalCooldownUntil = 0;   // timestamp ms
 
 function cacheGet(url) {
   const c = geckoCache.get(url);
@@ -251,11 +251,24 @@ async function geckoGet(url, ttlMs = 30000) {
   if (inflight) return inflight;
 
   const p = (async () => {
-    let attempt = 0;
-    let delay = 600;
+    const MAX_429_RETRIES = 12;
+    const MAX_TRANSIENT_RETRIES = 3;
+
+    let attempt429 = 0;
+    let attemptTransient = 0;
+
+    let delay = 800; // base delay for backoff
+    const MIN_BACKOFF_MS = 1000; // ✅ prevents 0ms spin
+    const MAX_BACKOFF_MS = 15000;
 
     while (true) {
-      attempt += 1;
+      // ✅ Global cooldown (if we got 429 anywhere, pause all requests)
+      const now = Date.now();
+      if (now < geckoGlobalCooldownUntil) {
+        const wait = geckoGlobalCooldownUntil - now;
+        await sleep(wait + jitter(200));
+      }
+
       try {
         const res = await axios.get(url, {
           headers: { 'Accept': 'application/json;version=20230302' },
@@ -267,28 +280,52 @@ async function geckoGet(url, ttlMs = 30000) {
       } catch (e) {
         const status = e?.response?.status;
 
-        // 429 - rate limit
         if (status === 429) {
-          const retryAfterRaw = e?.response?.headers?.['retry-after'];
-          const retryAfterMs =
-            retryAfterRaw && !Number.isNaN(Number(retryAfterRaw)) ? Number(retryAfterRaw) * 1000 : null;
+          attempt429 += 1;
 
-          const waitMs = retryAfterMs ?? Math.min(delay, 5000);
-          console.warn(`[GeckoTerminal] 429 rate-limited. Backing off ${waitMs}ms (attempt ${attempt}). url=${url}`);
+          const ra = e?.response?.headers?.['retry-after'];
+          const raNum = ra != null ? Number(ra) : NaN;
+          const retryAfterMs = Number.isFinite(raNum) ? raNum * 1000 : null;
+
+          // ✅ enforce minimum wait even if retry-after=0
+          const waitMs = Math.min(
+            MAX_BACKOFF_MS,
+            Math.max(MIN_BACKOFF_MS, retryAfterMs ?? delay)
+          ) + jitter(250);
+
+          // set global cooldown so ALL requests pause
+          geckoGlobalCooldownUntil = Date.now() + waitMs;
+
+          console.warn(
+            `[GeckoTerminal] 429 rate-limited. Backing off ${waitMs}ms (429-attempt ${attempt429}). url=${url}`
+          );
+
+          if (attempt429 >= MAX_429_RETRIES) {
+            const msg = `[GeckoTerminal] 429 limit reached (${MAX_429_RETRIES}). Skipping this cycle. url=${url}`;
+            throw new Error(msg);
+          }
+
           await sleep(waitMs);
-          delay = Math.min(delay * 1.6, 5000);
-          // do not cache failures
+          delay = Math.min(Math.floor(delay * 1.6), MAX_BACKOFF_MS);
           continue;
         }
 
-        // transient 5xx / network
+        // transient: network/timeout/5xx
         if (!status || (status >= 500 && status <= 599)) {
-          if (attempt <= 3) {
-            console.warn(`[GeckoTerminal] transient error (status=${status || 'net'}). retry in ${delay}ms (attempt ${attempt}). url=${url}`);
-            await sleep(delay);
-            delay = Math.min(delay * 1.6, 5000);
-            continue;
+          attemptTransient += 1;
+          const waitMs = Math.min(MAX_BACKOFF_MS, Math.max(600, delay)) + jitter(250);
+
+          console.warn(
+            `[GeckoTerminal] transient error (status=${status || 'net'}). retry in ${waitMs}ms (attempt ${attemptTransient}). url=${url}`
+          );
+
+          if (attemptTransient > MAX_TRANSIENT_RETRIES) {
+            throw e;
           }
+
+          await sleep(waitMs);
+          delay = Math.min(Math.floor(delay * 1.6), MAX_BACKOFF_MS);
+          continue;
         }
 
         // non-retriable
@@ -310,12 +347,11 @@ async function geckoGet(url, ttlMs = 30000) {
 async function fetchTopPoolForToken(tokenAddr) {
   const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
   try {
-    // Token info changes slowly -> cache longer
     const data = await geckoGet(url, 5 * 60 * 1000);
     const pools = data?.data?.relationships?.top_pools?.data || [];
     if (!pools.length) return null;
     const poolId = pools[0].id;
-    const pool = poolId.split('_').pop(); // Strip network prefix
+    const pool = poolId.split('_').pop();
     const symbol = data?.data?.attributes?.symbol || 'TOKEN';
     return { pool, symbol };
   } catch (e) {
@@ -327,7 +363,7 @@ async function fetchTopPoolForToken(tokenAddr) {
 async function fetchTradesForPool(pool) {
   try {
     const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
-    // Trades endpoint is hot -> tiny cache to stop burst loops
+    // Tiny cache to stop burst loops
     const data = await geckoGet(url, 1500);
     return normalizeTrades(data?.data);
   } catch (e) {
@@ -423,7 +459,7 @@ async function sendSettingsPanel(chatId, messageId = null) {
     }
   } catch (error) {
     if (error.message.includes("message can't be edited") || error.message.includes("message thread not found")) {
-      console.warn(`[WARN] Could not edit/send settings panel for chat ${chatId} (invalid message or thread). Sending new message.`);
+      console.warn(`[WARN] Could not edit/send settings panel for chat ${chatId}. Sending new message.`);
       try {
         if (messageId) await bot.deleteMessage(chatId, messageId, { ...opts });
       } catch (deleteErr) {
@@ -432,7 +468,6 @@ async function sendSettingsPanel(chatId, messageId = null) {
       if (error.message.includes("message thread not found")) {
         cfg.threadId = null;
         await setChat(chatId, cfg);
-        console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
         await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
       }
       await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
@@ -456,13 +491,11 @@ bot.onText(/\/settings|\/start/, async (msg) => {
       console.warn(`[WARN] Invalid thread ID ${msg.message_thread_id} for chat ${msg.chat.id}:`, error.message);
       cfg.threadId = null;
       await setChat(msg.chat.id, cfg);
-      console.log(`[INFO] Cleared threadId for chat ${msg.chat.id} (invalid topic)`);
       await bot.sendMessage(msg.chat.id, '⚠️ Invalid topic. Please run /settings in a valid topic.', {});
     }
   } else {
     cfg.threadId = null;
     await setChat(msg.chat.id, cfg);
-    console.log(`[INFO] Cleared threadId for chat ${msg.chat.id} (no message_thread_id)`);
   }
   await sendSettingsPanel(msg.chat.id);
 });
@@ -482,7 +515,6 @@ bot.onText(/\/resetthread/, async (msg) => {
   const opts = { message_thread_id: cfg.threadId || undefined };
   cfg.threadId = null;
   await setChat(chatId, cfg);
-  console.log(`[INFO] Cleared threadId for chat ${chatId} via /resetthread`);
   await bot.sendMessage(chatId, '✅ Topic thread ID cleared. Run /settings in a valid topic to set a new one.', { ...opts });
 });
 
@@ -535,35 +567,15 @@ bot.on('callback_query', async (query) => {
           ...opts
         });
       } catch (error) {
-        if (error.message.includes("message can't be edited") || error.message.includes("message thread not found")) {
-          console.warn(`[WARN] Could not edit remove_token message in chat ${chatId}. Sending new message.`);
-          try {
-            await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
-          } catch (deleteErr) {
-            console.warn(`[WARN] Could not delete message ${query.message.message_id}:`, deleteErr.message);
-          }
-          if (error.message.includes("message thread not found")) {
-            cfg.threadId = null;
-            await setChat(chatId, cfg);
-            console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
-            await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
-          }
-          await bot.sendMessage(chatId, 'Select a token to remove:', {
-            reply_markup: { inline_keyboard: rows }
-          });
-        } else {
-          console.error(`[ERROR] Failed to edit remove_token message for chat ${chatId}:`, error.message);
-        }
+        console.warn(`[WARN] Could not edit remove_token message in chat ${chatId}. Sending new message.`);
+        try { await bot.deleteMessage(chatId, query.message.message_id, { ...opts }); } catch {}
+        await bot.sendMessage(chatId, 'Select a token to remove:', { reply_markup: { inline_keyboard: rows } });
       }
       awaitingRemoveChoice.set(chatId, query.message.message_id);
       break;
 
     case 'done_settings':
-      try {
-        await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
-      } catch (deleteErr) {
-        console.warn(`[WARN] Could not delete settings message ${query.message.message_id}:`, deleteErr.message);
-      }
+      try { await bot.deleteMessage(chatId, query.message.message_id, { ...opts }); } catch {}
       await bot.sendMessage(chatId, '✅ Settings updated.', { ...opts });
       break;
 
@@ -590,36 +602,21 @@ bot.on('callback_query', async (query) => {
             ...opts
           }
         );
-      } catch (error) {
-        if (error.message.includes("message can't be edited") || error.message.includes("message thread not found")) {
-          console.warn(`[WARN] Could not edit tier_menu message in chat ${chatId}. Sending new message.`);
-          try {
-            await bot.deleteMessage(chatId, query.message.message_id, { ...opts });
-          } catch (deleteErr) {
-            console.warn(`[WARN] Could not delete message ${query.message.message_id}:`, deleteErr.message);
+      } catch {
+        await bot.sendMessage(chatId,
+          `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: `Small: $${cfg.tiers.small}`, callback_data: 'set_tier_small' },
+                 { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
+                [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
+              ]
+            },
+            ...opts
           }
-          if (error.message.includes("message thread not found")) {
-            cfg.threadId = null;
-            await setChat(chatId, cfg);
-            console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
-            await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
-          }
-          await bot.sendMessage(chatId,
-            `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
-            {
-              parse_mode: 'HTML',
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: `Small: $${cfg.tiers.small}`, callback_data: 'set_tier_small' },
-                   { text: `Large: $${cfg.tiers.large}`, callback_data: 'set_tier_large' }],
-                  [{ text: '⬅️ Back', callback_data: 'back_to_settings' }]
-                ]
-              }
-            }
-          );
-        } else {
-          console.error(`[ERROR] Failed to edit tier_menu message for chat ${chatId}:`, error.message);
-        }
+        );
       }
       break;
 
@@ -636,7 +633,6 @@ bot.on('callback_query', async (query) => {
     case 'toggle_sells':
       cfg.showSells = !cfg.showSells;
       await setChat(chatId, cfg);
-      await bot.answerCallbackQuery(query.id, { text: `Sell alerts ${cfg.showSells ? 'ON' : 'OFF'}` });
       await sendSettingsPanel(chatId, query.message.message_id);
       break;
 
@@ -655,15 +651,12 @@ bot.on('callback_query', async (query) => {
       cfg.videoChatId = null;
       cfg.videoValid = false;
       await setChat(chatId, cfg);
-      await bot.answerCallbackQuery(query.id, { text: 'Video removed.' });
       await sendSettingsPanel(chatId, query.message.message_id);
       break;
 
     case 'reset_thread':
       cfg.threadId = null;
       await setChat(chatId, cfg);
-      console.log(`[INFO] Cleared threadId for chat ${chatId} via reset_thread callback`);
-      await bot.answerCallbackQuery(query.id, { text: 'Thread ID cleared.' });
       await bot.sendMessage(chatId, '✅ Topic thread ID cleared. Run /settings in a valid topic to set a new one.', {});
       await sendSettingsPanel(chatId, query.message.message_id);
       break;
@@ -704,9 +697,6 @@ bot.on('callback_query', async (query) => {
           cfg2.pools = cfg2.pools.filter(p => p !== pool);
           delete cfg2.tokenSymbols[pool];
           await setChat(chatId, cfg2);
-          await bot.answerCallbackQuery(query.id, { text: 'Removed.' });
-        } else {
-          await bot.answerCallbackQuery(query.id, { text: 'Not found.' });
         }
         const msgId = awaitingRemoveChoice.get(chatId) || query.message.message_id;
         awaitingRemoveChoice.delete(chatId);
@@ -716,15 +706,13 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// -------- FIXED: Single Message Handler with Robust Video Handling --------
+// -------- Single Message Handler --------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
 
-  if (msg.text && msg.text.startsWith('/')) {
-    return;
-  }
+  if (msg.text && msg.text.startsWith('/')) return;
 
   if (pendingVideo.has(chatId)) {
     if (msg.video || (msg.document && msg.document.mime_type?.startsWith('video/'))) {
@@ -742,7 +730,7 @@ bot.on('message', async (msg) => {
           width: msg.video.width,
           height: msg.video.height
         };
-      } else if (msg.document) {
+      } else {
         fileId = msg.document.file_id;
         fileInfo = {
           type: 'document',
@@ -752,8 +740,6 @@ bot.on('message', async (msg) => {
           file_name: msg.document.file_name
         };
       }
-
-      console.log(`[VIDEO] Received video info:`, fileInfo);
 
       const isValid = await validateVideoFileId(chatId, fileId);
 
@@ -767,7 +753,7 @@ bot.on('message', async (msg) => {
       const status = isValid ? '✅ Video saved and validated!' : '⚠️ Video saved (validation warning - will try anyway)';
       await bot.sendMessage(chatId,
         `${status}\nWill play on every buy alert in this chat.\n\n` +
-        `File ID: \`${fileId}\`\n` +
+        `File ID: <code>${escapeHtml(fileId)}</code>\n` +
         `Size: ${fileInfo.file_size || 'unknown'} bytes\n` +
         `Type: ${fileInfo.type}`,
         { parse_mode: 'HTML', ...opts }
@@ -780,9 +766,7 @@ bot.on('message', async (msg) => {
             message_thread_id: cfg.threadId || undefined,
             supports_streaming: true
           });
-          console.log(`[VIDEO] Test send successful for ${fileId}`);
         } catch (testError) {
-          console.error(`[VIDEO] Test send failed for ${fileId}:`, testError.message);
           const cfg2 = await getChat(chatId);
           cfg2.videoValid = false;
           await setChat(chatId, cfg2);
@@ -795,8 +779,6 @@ bot.on('message', async (msg) => {
 
     } else if (msg.text && msg.text.startsWith('http')) {
       const url = msg.text.trim();
-      console.log(`[VIDEO] Received URL: ${url}`);
-
       cfg.videoUrl = url;
       cfg.videoFileId = null;
       cfg.videoChatId = chatId;
@@ -804,15 +786,9 @@ bot.on('message', async (msg) => {
       await setChat(chatId, cfg);
       pendingVideo.delete(chatId);
 
-      await bot.sendMessage(chatId,
-        `✅ Video URL saved!\nWill use this MP4 for every buy alert.`,
-        { ...opts }
-      );
+      await bot.sendMessage(chatId, `✅ Video URL saved!`, { ...opts });
     } else {
-      await bot.sendMessage(chatId,
-        '❌ Please send a video file (MP4) or a direct MP4 URL.',
-        { ...opts }
-      );
+      await bot.sendMessage(chatId, '❌ Please send a video file (MP4) or a direct MP4 URL.', { ...opts });
     }
     return;
   }
@@ -824,11 +800,13 @@ bot.on('message', async (msg) => {
     const isAddr = /^0x[a-fA-F0-9]{40}$/.test(token);
     const msgId = awaitingTokenInput.get(chatId);
     awaitingTokenInput.delete(chatId);
+
     if (!isAddr) {
       await bot.sendMessage(chatId, '❌ Invalid address. Please send a valid 0x token address.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
       return;
     }
+
     const top = await fetchTopPoolForToken(token);
     if (top) {
       const cfg = await getChat(chatId);
@@ -848,6 +826,7 @@ bot.on('message', async (msg) => {
     const val = Number(msg.text);
     const msgId = awaitingMinBuyInput.get(chatId);
     awaitingMinBuyInput.delete(chatId);
+
     if (!Number.isFinite(val) || val < 0) {
       await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
@@ -865,6 +844,7 @@ bot.on('message', async (msg) => {
     const { which, msg: msgId } = awaitingTierInput.get(chatId);
     awaitingTierInput.delete(chatId);
     const val = Number(msg.text);
+
     if (!Number.isFinite(val) || val < 0) {
       await bot.sendMessage(chatId, '❌ Please enter a valid non-negative number.', { ...opts });
       await sendSettingsPanel(chatId, msgId);
@@ -881,6 +861,7 @@ bot.on('message', async (msg) => {
   if (compWizard.has(chatId)) {
     const wizard = compWizard.get(chatId);
     const data = wizard.data;
+
     if (wizard.step === 1) {
       const minutes = Number(msg.text);
       if (!minutes || minutes < 1) return bot.sendMessage(chatId, 'Enter a valid duration in minutes:', { ...opts });
@@ -888,16 +869,19 @@ bot.on('message', async (msg) => {
       wizard.step = 2;
       return bot.sendMessage(chatId, 'Enter minimum buy USD to qualify:', { ...opts });
     }
+
     if (wizard.step === 2) {
       data.minBuyUsd = Number(msg.text) || 0;
       wizard.step = 3;
       return bot.sendMessage(chatId, 'Enter prize for 🥇 1st place:', { ...opts });
     }
+
     if (wizard.step === 3) {
       data.prize1 = msg.text;
       wizard.step = 4;
       return bot.sendMessage(chatId, 'Enter prizes for 🥈 2nd and 🥉 3rd (comma separated):', { ...opts });
     }
+
     if (wizard.step === 4) {
       const [p2, p3] = msg.text.split(',').map(x => x.trim());
       data.prizes = [data.prize1, p2, p3];
@@ -917,170 +901,6 @@ bot.on('message', async (msg) => {
       return;
     }
   }
-});
-
-// -------- Video Test Command --------
-bot.onText(/\/testvideo (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const opts = { message_thread_id: (await getChat(chatId)).threadId || undefined };
-  const fileId = match[1].trim();
-
-  if (!fileId) {
-    return bot.sendMessage(chatId, 'Usage: /testvideo <file_id>', { ...opts });
-  }
-
-  const isValid = await validateVideoFileId(chatId, fileId);
-  await bot.sendMessage(chatId,
-    `Video validation result for ${fileId}:\n` +
-    `Status: ${isValid ? '✅ VALID' : '❌ INVALID'}\n` +
-    `Chat: ${chatId}`,
-    { ...opts }
-  );
-
-  try {
-    await bot.sendVideo(chatId, fileId, {
-      caption: '🧪 Test video - if you see this, video works!',
-      message_thread_id: opts.message_thread_id,
-      supports_streaming: true
-    });
-    await bot.sendMessage(chatId, `✅ Test send successful!`, { ...opts });
-  } catch (testError) {
-    await bot.sendMessage(chatId,
-      `❌ Test send failed: ${testError.message}`,
-      { ...opts }
-    );
-  }
-});
-
-// -------- Backward-compatible commands --------
-bot.onText(/\/add (0x[a-fA-F0-9]{40})/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  const token = match[1];
-  const top = await fetchTopPoolForToken(token);
-  if (!top) return bot.sendMessage(chatId, '❌ No pool found for that token on this network.', { ...opts });
-  if (!cfg.pools.includes(top.pool)) cfg.pools.push(top.pool);
-  cfg.tokenSymbols[top.pool] = top.symbol || 'TOKEN';
-  await setChat(chatId, cfg);
-  const chart = `https://www.geckoterminal.com/${GECKO_NETWORK}/pools/${top.pool}`;
-  await bot.sendMessage(chatId, `✅ Tracking <b>${escapeHtml(top.symbol)}</b>\nPool: <code>${top.pool}</code>`, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '📈 Chart', url: chart }]] },
-    ...opts
-  });
-});
-
-bot.onText(/\/remove (0x[a-fA-F0-9]{40})/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  const token = match[1];
-  const top = await fetchTopPoolForToken(token);
-  if (!top) return bot.sendMessage(chatId, '❌ Could not resolve a pool for that token.', { ...opts });
-  cfg.pools = cfg.pools.filter(p => p !== top.pool);
-  delete cfg.tokenSymbols[top.pool];
-  await setChat(chatId, cfg);
-  await bot.sendMessage(chatId, `🛑 Stopped tracking pool ${top.pool}`, { ...opts });
-});
-
-bot.onText(/\/list/, async (msg) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  if (!cfg.pools.length) return bot.sendMessage(chatId, 'No pools yet. Add with /add 0xYourToken or use /settings → Add Token', { ...opts });
-  const lines = cfg.pools.map(p => `• <code>${p}</code> (${escapeHtml(cfg.tokenSymbols[p] || 'TOKEN')})`);
-  await bot.sendMessage(chatId, `<b>Tracking:</b>\n${lines.join('\n')}`, { parse_mode: 'HTML', ...opts });
-});
-
-bot.onText(/\/minbuy (\d+(\.\d+)?)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  const min = Number(match[1]);
-  cfg.minBuyUsd = min;
-  await setChat(chatId, cfg);
-  await bot.sendMessage(chatId, `✅ Minimum buy set to $${min}`, { ...opts });
-});
-
-bot.onText(/\/setvideo(?: (https?:\/\/\S+))?$/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-
-  if (match[1]) {
-    cfg.videoUrl = match[1];
-    cfg.videoFileId = null;
-    cfg.videoChatId = chatId;
-    cfg.videoValid = true;
-    await setChat(chatId, cfg);
-    await bot.sendMessage(chatId, '✅ Video URL set.', { ...opts });
-  } else {
-    pendingVideo.set(chatId, true);
-    await bot.sendMessage(chatId,
-      '📹 Send the MP4 video (max 50MB) for alerts.\n' +
-      'Or send a direct MP4 URL next.',
-      { ...opts }
-    );
-  }
-});
-
-bot.onText(/\/emoji (small|mid|large) (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  const which = match[1];
-  const value = match[2];
-  cfg.emoji[which] = value;
-  await setChat(chatId, cfg);
-  await bot.sendMessage(chatId, `✅ ${which} emoji → ${value}`, { ...opts });
-});
-
-bot.onText(/\/tier (small|large) (\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  const which = match[1];
-  const value = Number(match[2]);
-  cfg.tiers[which] = value;
-  await setChat(chatId, cfg);
-  await bot.sendMessage(chatId, `✅ ${which} buy threshold set to $${value}`, { ...opts });
-});
-
-bot.onText(/\/showsells (on|off)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  const value = match[1].toLowerCase() === 'on';
-  cfg.showSells = value;
-  await setChat(chatId, cfg);
-  await bot.sendMessage(chatId, `✅ Sell alerts are now ${value ? 'ON' : 'OFF'}`, { ...opts });
-});
-
-bot.onText(/\/status/, async (msg) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
-  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? `✅ custom set (chat ${cfg.videoChatId})` : `⚠️ invalid file (chat ${cfg.videoChatId})`) :
-                     (cfg.videoUrl ? `🔗 ${cfg.videoUrl}` : '❌ none');
-  const statusText =
-    `<b>Current Config</b>\n` +
-    `Pools:\n${pools}\n\n` +
-    `Min Buy: $${cfg.minBuyUsd}\n` +
-    `Sells: ${cfg.showSells ? 'ON' : 'OFF'}\n` +
-    `Whale Tier: $${cfg.tiers.large}, Mid Tier: $${cfg.tiers.small}\n` +
-    `Video: ${videoStatus}\n` +
-    `Thread ID: ${cfg.threadId ? cfg.threadId : 'None'}\n` +
-    `${cfg.activeCompetition ? '🏆 Big Buy Comp ACTIVE' : ''}`;
-  await bot.sendMessage(chatId, statusText, { parse_mode: 'HTML', ...opts });
-});
-
-bot.onText(/\/ping/, async (msg) => {
-  const chatId = msg.chat.id;
-  const cfg = await getChat(chatId);
-  const opts = { message_thread_id: cfg.threadId || undefined };
-  await bot.sendMessage(chatId, '✅ Bot is online and running.', { ...opts });
 });
 
 // -------- Leaderboard + Competition --------
@@ -1124,39 +944,20 @@ async function refreshPoolSet() {
       : [...memoryStore.keys()].map(k => `chat:${k}:config`);
 
     const set = new Set();
-
-    console.log(`[DEBUG] refreshPoolSet found ${keys.length} chat configs`);
-
     for (const k of keys) {
       const chatId = Number(k.split(':')[1]);
       let cfg;
-
       try {
         cfg = redis ? JSON.parse(await redis.get(k) || '{}') : memoryStore.get(chatId);
-      } catch (err) {
-        console.error(`[ERROR] Failed to parse config for chat ${chatId}:`, err.message);
+      } catch {
         continue;
       }
-
-      if (!cfg) {
-        console.warn(`[WARN] No config for chat ${chatId}`);
-        continue;
-      }
-
-      if (!cfg.pools || cfg.pools.length === 0) {
-        console.debug(`[DEBUG] Chat ${chatId} has no pools configured`);
-        continue;
-      }
-
-      cfg.pools.forEach((p) => {
-        console.debug(`[DEBUG] Adding pool ${p} from chat ${chatId}`);
-        set.add(p);
-      });
+      if (!cfg?.pools?.length) continue;
+      cfg.pools.forEach((p) => set.add(p));
     }
 
     poolRoundRobin = Array.from(set);
-    console.log(`[INFO] poolRoundRobin now has ${poolRoundRobin.length} pools:`, poolRoundRobin);
-
+    console.log(`[INFO] poolRoundRobin has ${poolRoundRobin.length} pools`);
   } catch (e) {
     console.error(`[ERROR] refreshPoolSet failed:`, e.message);
   }
@@ -1182,46 +983,25 @@ async function safeSend(chatId, sendFn) {
     await sendFn(opts);
   } catch (e) {
     const desc = e.response?.body?.description || '';
-    if (desc.includes('kicked') || desc.includes('forbidden') || desc.includes('group chat was upgraded to a supergroup chat')) {
-      console.log(`[INFO] Chat ${chatId} is invalid (kicked, forbidden, or upgraded to supergroup). Cleaning config.`);
-      if (redis) await redis.del(`chat:${chatId}:config`);
-      else memoryStore.delete(chatId);
-      try {
-        await bot.sendMessage(chatId, '⚠️ Chat was upgraded to a supergroup or the bot was removed. Please run /settings to reconfigure.', {});
-      } catch (notifyErr) {
-        console.warn(`[WARN] Could not notify chat ${chatId} about upgrade:`, notifyErr.message);
-      }
-    } else if (desc.includes('file_id') || desc.includes('not found') || desc.includes('message thread not found')) {
-      console.warn(`[WARN] Invalid operation for chat ${chatId} (video file_id or thread not found). Falling back.`);
+    if (desc.includes('message thread not found')) {
       const cfg = await getChat(chatId);
-      if (desc.includes('message thread not found')) {
-        cfg.threadId = null;
-        await setChat(chatId, cfg);
-        console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
-        try {
-          await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
-        } catch (notifyErr) {
-          console.warn(`[WARN] Could not notify chat ${chatId} about invalid topic:`, notifyErr.message);
-        }
-      }
+      cfg.threadId = null;
+      await setChat(chatId, cfg);
       await sendFn({});
-    } else {
-      console.error(`[ERROR] Telegram send failed for chat ${chatId}:`, e.message, desc);
+      return;
     }
+    await sendFn({}); // fallback no thread
   }
 }
 
 async function buildExtraDataForTrade(pool, trade) {
   let extraData = '';
-
   try {
     const tokenAddr = trade.toToken || trade.fromToken;
     if (!tokenAddr) return '';
-
     const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
     const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
 
-    // Cache these for 60s (huge reduction in spam)
     const [tokenData, poolData] = await Promise.all([
       geckoGet(tokenUrl, 60000),
       geckoGet(poolUrl, 60000)
@@ -1252,26 +1032,19 @@ async function buildExtraDataForTrade(pool, trade) {
     if (mcValue && mcValue > 0) extraData += `📊 ${mcLabel}: $${formatUSD(mcValue)}\n`;
     if (poolAttr.reserve_in_usd) extraData += `💧 Liquidity: $${formatUSD(Number(poolAttr.reserve_in_usd))}\n`;
     if (poolAttr.volume_usd_24h) extraData += `📈 24h Vol: $${formatUSD(Number(poolAttr.volume_usd_24h))}\n`;
-
     if (tokenAttr.price_percent_change_24h != null) {
       const pct = Number(tokenAttr.price_percent_change_24h);
       if (Number.isFinite(pct)) extraData += `📊 24h Change: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%\n`;
     }
-
-    if (tokenAttr.unique_wallet_count) {
-      extraData += `👥 Holders: ${tokenAttr.unique_wallet_count}\n`;
-    }
+    if (tokenAttr.unique_wallet_count) extraData += `👥 Holders: ${tokenAttr.unique_wallet_count}\n`;
   } catch (e) {
     console.warn(`[DEBUG] Extra data fetch failed:`, e.response?.status, e.response?.data || e.message);
   }
-
   return extraData;
 }
 
 async function broadcastTrade(pool, trade) {
   const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
-
-  // ✅ IMPORTANT: Build extraData ONCE per trade (not once per chat)
   const sharedExtraData = await buildExtraDataForTrade(pool, trade);
 
   for (const k of keys) {
@@ -1311,14 +1084,7 @@ async function broadcastTrade(pool, trade) {
     };
 
     await safeSend(chatId, async () => {
-      const usedVideo = await safeSendVideo(
-        chatId,
-        cfg,
-        caption,
-        replyMarkup,
-        cfg.threadId
-      );
-
+      const usedVideo = await safeSendVideo(chatId, cfg, caption, replyMarkup, cfg.threadId);
       if (!usedVideo) {
         await bot.sendMessage(chatId, caption, {
           parse_mode: 'HTML',
@@ -1345,10 +1111,11 @@ async function tickOnce() {
 }
 
 /**
- * Keep your fast loop if you want, but queue hard-caps real GT calls to ~1/sec.
- * This preserves “feels instant” while preventing 429s.
+ * ✅ Backlog guard: if we’re already behind, don’t keep piling work.
+ * (Prevents huge queue growth during long 429 periods)
  */
 setInterval(() => {
+  if (queue.size > 3) return;
   queue.add(tickOnce).catch((e) => {
     console.error('[TICK] failed:', e?.response?.status, e?.response?.data || e.message);
   });
