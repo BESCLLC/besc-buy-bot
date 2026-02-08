@@ -17,7 +17,19 @@ if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
-const queue = new PQueue({ interval: Number(POLL_INTERVAL_MS), intervalCap: 5 });
+
+/**
+ * 🔥 RATE-LIMIT FIX:
+ * Your old config could burst 5 GT requests per POLL_INTERVAL_MS and spam token+pool calls per chat.
+ * We hard-cap GeckoTerminal to ~1 request/sec (safe), regardless of POLL_INTERVAL_MS.
+ * This preserves your bot behavior (still checks frequently) but prevents API nukes.
+ */
+const queue = new PQueue({
+  interval: 1000,
+  intervalCap: 1,
+  carryoverConcurrencyCount: true,
+  concurrency: 1
+});
 
 const app = express();
 app.get('/healthz', (_, res) => res.send('ok'));
@@ -39,6 +51,11 @@ const compWizard = new Map();
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
+
+// ---------- small helpers ----------
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 // -------- Config helpers --------
 function defaultChatConfig() {
@@ -114,45 +131,44 @@ async function validateVideoFileId(chatId, fileId) {
   try {
     console.log(`[VIDEO] Attempting to validate file_id: ${fileId}`);
     const file = await bot.getFile(fileId);
-    
+
     console.log(`[VIDEO] File info for ${fileId}:`, {
       file_path: file.file_path,
       file_size: file.file_size,
       mime_type: file.mime_type,
       file_unique_id: file.file_unique_id
     });
-    
+
     // Basic checks
     if (!file.file_path) {
       console.warn(`[VIDEO] No file_path for ${fileId}`);
       return false;
     }
-    
+
     if (file.file_size >= 50 * 1024 * 1024) {
       console.warn(`[VIDEO] File too large: ${file.file_size} bytes`);
       return false;
     }
-    
+
     // More lenient MIME type check - accept various video formats
-    const isVideo = file.mime_type?.startsWith('video/') || 
-                   file.file_path?.includes('.mp4') || 
-                   file.file_path?.includes('.mov') ||
-                   file.file_path?.includes('.avi') ||
-                   file.mime_type === 'application/octet-stream'; // Telegram sometimes uses this for videos
-    
+    const isVideo =
+      file.mime_type?.startsWith('video/') ||
+      file.file_path?.includes('.mp4') ||
+      file.file_path?.includes('.mov') ||
+      file.file_path?.includes('.avi') ||
+      file.mime_type === 'application/octet-stream'; // Telegram sometimes uses this for videos
+
     if (!isVideo) {
       console.warn(`[VIDEO] Not recognized as video: mime=${file.mime_type}, path=${file.file_path}`);
-      // Still accept it - better to be permissive than strict
       console.log(`[VIDEO] Accepting file anyway (lenient mode)`);
       return true;
     }
-    
+
     console.log(`[VIDEO] ✅ Validated file_id ${fileId} for chat ${chatId}: ${file.file_path} (${file.file_size} bytes)`);
     return true;
-    
+
   } catch (error) {
     console.error(`[VIDEO] Failed to validate file_id ${fileId}:`, error.message);
-    // Be extra lenient - if validation fails, still accept the file
     console.log(`[VIDEO] Accepting file despite validation error (lenient mode)`);
     return true;
   }
@@ -161,7 +177,7 @@ async function validateVideoFileId(chatId, fileId) {
 // -------- Safe video sender --------
 async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId) {
   const { videoFileId, videoUrl, videoValid } = videoConfig;
-  
+
   // Try URL first (most reliable for videos)
   if (videoUrl) {
     try {
@@ -179,9 +195,9 @@ async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId
       console.warn(`[VIDEO] URL video failed: ${urlError.message}`);
     }
   }
-  
+
   // Try file_id if valid
-  if (videoFileId && videoValid !== false) { // Changed: allow if not explicitly invalid
+  if (videoFileId && videoValid !== false) {
     try {
       console.log(`[VIDEO] Sending file_id video: ${videoFileId}`);
       await bot.sendVideo(chatId, videoFileId, {
@@ -196,26 +212,106 @@ async function safeSendVideo(chatId, videoConfig, caption, replyMarkup, threadId
     } catch (fileError) {
       console.error(`[VIDEO] File_id video failed: ${fileError.message}`);
       console.error(`[VIDEO] Full error:`, fileError);
-      // Mark invalid and fallback
       const cfg = await getChat(chatId);
       cfg.videoValid = false;
       await setChat(chatId, cfg);
       console.log(`[VIDEO] Marked video as invalid for chat ${chatId}`);
     }
   }
-  
-  // Fallback to text
+
   console.log(`[VIDEO] Falling back to text for chat ${chatId}`);
   return false;
+}
+
+/**
+ * ✅ GeckoTerminal hardening:
+ * - in-memory TTL cache
+ * - in-flight de-dupe (same URL only hits once even if multiple callers)
+ * - gentle retry/backoff on 429 + transient errors
+ */
+const geckoCache = new Map();   // url -> { ts, ttl, data }
+const geckoInflight = new Map(); // url -> Promise
+
+function cacheGet(url) {
+  const c = geckoCache.get(url);
+  if (!c) return null;
+  if (Date.now() - c.ts > c.ttl) return null;
+  return c.data;
+}
+
+function cacheSet(url, data, ttl) {
+  geckoCache.set(url, { ts: Date.now(), ttl, data });
+}
+
+async function geckoGet(url, ttlMs = 30000) {
+  const cached = cacheGet(url);
+  if (cached) return cached;
+
+  const inflight = geckoInflight.get(url);
+  if (inflight) return inflight;
+
+  const p = (async () => {
+    let attempt = 0;
+    let delay = 600;
+
+    while (true) {
+      attempt += 1;
+      try {
+        const res = await axios.get(url, {
+          headers: { 'Accept': 'application/json;version=20230302' },
+          timeout: 15000
+        });
+
+        cacheSet(url, res.data, ttlMs);
+        return res.data;
+      } catch (e) {
+        const status = e?.response?.status;
+
+        // 429 - rate limit
+        if (status === 429) {
+          const retryAfterRaw = e?.response?.headers?.['retry-after'];
+          const retryAfterMs =
+            retryAfterRaw && !Number.isNaN(Number(retryAfterRaw)) ? Number(retryAfterRaw) * 1000 : null;
+
+          const waitMs = retryAfterMs ?? Math.min(delay, 5000);
+          console.warn(`[GeckoTerminal] 429 rate-limited. Backing off ${waitMs}ms (attempt ${attempt}). url=${url}`);
+          await sleep(waitMs);
+          delay = Math.min(delay * 1.6, 5000);
+          // do not cache failures
+          continue;
+        }
+
+        // transient 5xx / network
+        if (!status || (status >= 500 && status <= 599)) {
+          if (attempt <= 3) {
+            console.warn(`[GeckoTerminal] transient error (status=${status || 'net'}). retry in ${delay}ms (attempt ${attempt}). url=${url}`);
+            await sleep(delay);
+            delay = Math.min(delay * 1.6, 5000);
+            continue;
+          }
+        }
+
+        // non-retriable
+        throw e;
+      }
+    }
+  })();
+
+  geckoInflight.set(url, p);
+
+  try {
+    return await p;
+  } finally {
+    geckoInflight.delete(url);
+  }
 }
 
 // -------- GeckoTerminal wrappers --------
 async function fetchTopPoolForToken(tokenAddr) {
   const url = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
   try {
-    const { data } = await axios.get(url, {
-      headers: { 'Accept': 'application/json;version=20230302' }
-    });
+    // Token info changes slowly -> cache longer
+    const data = await geckoGet(url, 5 * 60 * 1000);
     const pools = data?.data?.relationships?.top_pools?.data || [];
     if (!pools.length) return null;
     const poolId = pools[0].id;
@@ -223,7 +319,7 @@ async function fetchTopPoolForToken(tokenAddr) {
     const symbol = data?.data?.attributes?.symbol || 'TOKEN';
     return { pool, symbol };
   } catch (e) {
-    console.error(`[GeckoTerminal] Failed to fetch top pool for ${tokenAddr}:`, e.message);
+    console.error(`[GeckoTerminal] Failed to fetch top pool for ${tokenAddr}:`, e.response?.status, e.response?.data || e.message);
     return null;
   }
 }
@@ -231,14 +327,12 @@ async function fetchTopPoolForToken(tokenAddr) {
 async function fetchTradesForPool(pool) {
   try {
     const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}/trades?limit=5`;
-    const { data } = await axios.get(url, {
-      headers: { 'Accept': 'application/json;version=20230302' }
-    });
+    // Trades endpoint is hot -> tiny cache to stop burst loops
+    const data = await geckoGet(url, 1500);
     return normalizeTrades(data?.data);
   } catch (e) {
     console.error(`[GeckoTerminal] Failed for pool ${pool}:`, e.response?.status, e.response?.data || e.message);
     if (e.response?.status === 404) {
-      // Notify chats tracking this pool
       const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
       for (const k of keys) {
         const chatId = Number(k.split(':')[1]);
@@ -281,9 +375,9 @@ async function sendSettingsPanel(chatId, messageId = null) {
   const tokens = cfg.pools.length
     ? cfg.pools.map(p => cfg.tokenSymbols[p] || (p.slice(0,6)+'…'+p.slice(-4))).join(', ')
     : 'None';
-  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? '✅ valid' : '⚠️ invalid') : 
+  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? '✅ valid' : '⚠️ invalid') :
                      (cfg.videoUrl ? '🔗 URL' : '❌ none');
-  
+
   const text =
     `⚙️ <b>Settings Panel</b>\n` +
     `<b>Tracking:</b> ${escapeHtml(tokens)}\n` +
@@ -317,12 +411,12 @@ async function sendSettingsPanel(chatId, messageId = null) {
 
   try {
     if (messageId) {
-      await bot.editMessageText(text, { 
-        chat_id: chatId, 
-        message_id: messageId, 
-        parse_mode: 'HTML', 
-        reply_markup: keyboard, 
-        ...opts 
+      await bot.editMessageText(text, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+        ...opts
       });
     } else {
       await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard, ...opts });
@@ -510,7 +604,7 @@ bot.on('callback_query', async (query) => {
             console.log(`[INFO] Cleared threadId for chat ${chatId} due to invalid topic`);
             await bot.sendMessage(chatId, '⚠️ Topic not found. Thread ID cleared. Please run /settings in a valid topic.', {});
           }
-          await bot.sendMessage(chatId, 
+          await bot.sendMessage(chatId,
             `🐋 Adjust Whale & Mid Tier Thresholds:\nCurrent: Small $${cfg.tiers.small}, Large $${cfg.tiers.large}`,
             {
               parse_mode: 'HTML',
@@ -548,9 +642,9 @@ bot.on('callback_query', async (query) => {
 
     case 'set_video':
       pendingVideo.set(chatId, true);
-      await bot.sendMessage(chatId, 
+      await bot.sendMessage(chatId,
         '📹 Send the video (MP4, max 50MB) you want to use for alerts.\n' +
-        'Or reply with a direct MP4 URL.', 
+        'Or reply with a direct MP4 URL.',
         { ...opts }
       );
       break;
@@ -632,12 +726,11 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // FIXED: Handle video setting with robust validation
   if (pendingVideo.has(chatId)) {
     if (msg.video || (msg.document && msg.document.mime_type?.startsWith('video/'))) {
       let fileId;
       let fileInfo = {};
-      
+
       if (msg.video) {
         fileId = msg.video.file_id;
         fileInfo = {
@@ -659,30 +752,27 @@ bot.on('message', async (msg) => {
           file_name: msg.document.file_name
         };
       }
-      
+
       console.log(`[VIDEO] Received video info:`, fileInfo);
-      
-      // Validate the file (but be lenient)
+
       const isValid = await validateVideoFileId(chatId, fileId);
-      
-      // Save regardless - validation failures won't break it
+
       cfg.videoFileId = fileId;
       cfg.videoUrl = null;
       cfg.videoChatId = chatId;
       cfg.videoValid = isValid;
       await setChat(chatId, cfg);
       pendingVideo.delete(chatId);
-      
+
       const status = isValid ? '✅ Video saved and validated!' : '⚠️ Video saved (validation warning - will try anyway)';
-      await bot.sendMessage(chatId, 
+      await bot.sendMessage(chatId,
         `${status}\nWill play on every buy alert in this chat.\n\n` +
         `File ID: \`${fileId}\`\n` +
         `Size: ${fileInfo.file_size || 'unknown'} bytes\n` +
-        `Type: ${fileInfo.type}`, 
+        `Type: ${fileInfo.type}`,
         { parse_mode: 'HTML', ...opts }
       );
-      
-      // Test send immediately to verify
+
       setTimeout(async () => {
         try {
           await bot.sendVideo(chatId, fileId, {
@@ -696,32 +786,31 @@ bot.on('message', async (msg) => {
           const cfg2 = await getChat(chatId);
           cfg2.videoValid = false;
           await setChat(chatId, cfg2);
-          await bot.sendMessage(chatId, 
-            `⚠️ Test send failed - video marked invalid. Use /removevideo and try again.`, 
+          await bot.sendMessage(chatId,
+            `⚠️ Test send failed - video marked invalid. Use /removevideo and try again.`,
             { ...opts }
           );
         }
-      }, 3000); // Wait 3 seconds before test
-      
+      }, 3000);
+
     } else if (msg.text && msg.text.startsWith('http')) {
-      // Handle URL
       const url = msg.text.trim();
       console.log(`[VIDEO] Received URL: ${url}`);
-      
+
       cfg.videoUrl = url;
       cfg.videoFileId = null;
       cfg.videoChatId = chatId;
       cfg.videoValid = true;
       await setChat(chatId, cfg);
       pendingVideo.delete(chatId);
-      
-      await bot.sendMessage(chatId, 
-        `✅ Video URL saved!\nWill use this MP4 for every buy alert.`, 
+
+      await bot.sendMessage(chatId,
+        `✅ Video URL saved!\nWill use this MP4 for every buy alert.`,
         { ...opts }
       );
     } else {
-      await bot.sendMessage(chatId, 
-        '❌ Please send a video file (MP4) or a direct MP4 URL.', 
+      await bot.sendMessage(chatId,
+        '❌ Please send a video file (MP4) or a direct MP4 URL.',
         { ...opts }
       );
     }
@@ -835,20 +924,19 @@ bot.onText(/\/testvideo (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const opts = { message_thread_id: (await getChat(chatId)).threadId || undefined };
   const fileId = match[1].trim();
-  
+
   if (!fileId) {
     return bot.sendMessage(chatId, 'Usage: /testvideo <file_id>', { ...opts });
   }
-  
+
   const isValid = await validateVideoFileId(chatId, fileId);
-  await bot.sendMessage(chatId, 
+  await bot.sendMessage(chatId,
     `Video validation result for ${fileId}:\n` +
     `Status: ${isValid ? '✅ VALID' : '❌ INVALID'}\n` +
-    `Chat: ${chatId}`, 
+    `Chat: ${chatId}`,
     { ...opts }
   );
-  
-  // Try to send test
+
   try {
     await bot.sendVideo(chatId, fileId, {
       caption: '🧪 Test video - if you see this, video works!',
@@ -857,8 +945,8 @@ bot.onText(/\/testvideo (.+)/, async (msg, match) => {
     });
     await bot.sendMessage(chatId, `✅ Test send successful!`, { ...opts });
   } catch (testError) {
-    await bot.sendMessage(chatId, 
-      `❌ Test send failed: ${testError.message}`, 
+    await bot.sendMessage(chatId,
+      `❌ Test send failed: ${testError.message}`,
       { ...opts }
     );
   }
@@ -919,9 +1007,8 @@ bot.onText(/\/setvideo(?: (https?:\/\/\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
-  
+
   if (match[1]) {
-    // URL provided
     cfg.videoUrl = match[1];
     cfg.videoFileId = null;
     cfg.videoChatId = chatId;
@@ -929,11 +1016,10 @@ bot.onText(/\/setvideo(?: (https?:\/\/\S+))?$/, async (msg, match) => {
     await setChat(chatId, cfg);
     await bot.sendMessage(chatId, '✅ Video URL set.', { ...opts });
   } else {
-    // Wait for video
     pendingVideo.set(chatId, true);
-    await bot.sendMessage(chatId, 
+    await bot.sendMessage(chatId,
       '📹 Send the MP4 video (max 50MB) for alerts.\n' +
-      'Or send a direct MP4 URL next.', 
+      'Or send a direct MP4 URL next.',
       { ...opts }
     );
   }
@@ -976,7 +1062,7 @@ bot.onText(/\/status/, async (msg) => {
   const cfg = await getChat(chatId);
   const opts = { message_thread_id: cfg.threadId || undefined };
   const pools = cfg.pools.length ? cfg.pools.map(p => `<code>${p}</code>`).join('\n') : 'None';
-  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? `✅ custom set (chat ${cfg.videoChatId})` : `⚠️ invalid file (chat ${cfg.videoChatId})`) : 
+  const videoStatus = cfg.videoFileId ? (cfg.videoValid ? `✅ custom set (chat ${cfg.videoChatId})` : `⚠️ invalid file (chat ${cfg.videoChatId})`) :
                      (cfg.videoUrl ? `🔗 ${cfg.videoUrl}` : '❌ none');
   const statusText =
     `<b>Current Config</b>\n` +
@@ -1076,7 +1162,6 @@ async function refreshPoolSet() {
   }
 }
 
-// Call once at startup, then every 10s
 refreshPoolSet();
 setInterval(refreshPoolSet, 10000);
 
@@ -1126,8 +1211,69 @@ async function safeSend(chatId, sendFn) {
   }
 }
 
+async function buildExtraDataForTrade(pool, trade) {
+  let extraData = '';
+
+  try {
+    const tokenAddr = trade.toToken || trade.fromToken;
+    if (!tokenAddr) return '';
+
+    const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
+    const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
+
+    // Cache these for 60s (huge reduction in spam)
+    const [tokenData, poolData] = await Promise.all([
+      geckoGet(tokenUrl, 60000),
+      geckoGet(poolUrl, 60000)
+    ]);
+
+    const tokenAttr = tokenData?.data?.attributes || {};
+    const poolAttr = poolData?.data?.attributes || {};
+    const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
+
+    let mcLabel = 'MC';
+    let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
+
+    if (!mcValue && price > 0) {
+      const circ = adjustSupply(tokenAttr.circulating_supply, tokenAttr.decimals ?? 18);
+      if (circ > 0) mcValue = circ * price;
+      else if (tokenAttr.fdv_usd) {
+        mcValue = Number(tokenAttr.fdv_usd);
+        mcLabel = 'FDV';
+      } else {
+        const total = adjustSupply(tokenAttr.total_supply, tokenAttr.decimals ?? 18);
+        if (total > 0) {
+          mcValue = total * price;
+          mcLabel = 'FDV';
+        }
+      }
+    }
+
+    if (mcValue && mcValue > 0) extraData += `📊 ${mcLabel}: $${formatUSD(mcValue)}\n`;
+    if (poolAttr.reserve_in_usd) extraData += `💧 Liquidity: $${formatUSD(Number(poolAttr.reserve_in_usd))}\n`;
+    if (poolAttr.volume_usd_24h) extraData += `📈 24h Vol: $${formatUSD(Number(poolAttr.volume_usd_24h))}\n`;
+
+    if (tokenAttr.price_percent_change_24h != null) {
+      const pct = Number(tokenAttr.price_percent_change_24h);
+      if (Number.isFinite(pct)) extraData += `📊 24h Change: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%\n`;
+    }
+
+    if (tokenAttr.unique_wallet_count) {
+      extraData += `👥 Holders: ${tokenAttr.unique_wallet_count}\n`;
+    }
+  } catch (e) {
+    console.warn(`[DEBUG] Extra data fetch failed:`, e.response?.status, e.response?.data || e.message);
+  }
+
+  return extraData;
+}
+
 async function broadcastTrade(pool, trade) {
   const keys = redis ? await redis.keys('chat:*:config') : [...memoryStore.keys()].map(k => `chat:${k}:config`);
+
+  // ✅ IMPORTANT: Build extraData ONCE per trade (not once per chat)
+  const sharedExtraData = await buildExtraDataForTrade(pool, trade);
+
   for (const k of keys) {
     const chatId = Number(k.split(':')[1]);
     const cfg = redis ? JSON.parse(await redis.get(k)) : memoryStore.get(chatId);
@@ -1143,53 +1289,6 @@ async function broadcastTrade(pool, trade) {
       await setChat(chatId, cfg);
     }
 
-    let extraData = '';
-    try {
-      const tokenAddr = trade.toToken || trade.fromToken;
-      if (tokenAddr) {
-        const tokenUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/tokens/${tokenAddr.toLowerCase()}`;
-        const poolUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${pool}`;
-        const [tokenRes, poolRes] = await Promise.all([
-          axios.get(tokenUrl, { headers: { 'Accept': 'application/json;version=20230302' } }),
-          axios.get(poolUrl, { headers: { 'Accept': 'application/json;version=20230302' } })
-        ]);
-
-        const tokenAttr = tokenRes?.data?.data?.attributes || {};
-        const poolAttr = poolRes?.data?.data?.attributes || {};
-        const price = Number(trade.priceUsd || tokenAttr.price_usd || 0);
-
-        let mcLabel = 'MC';
-        let mcValue = Number(tokenAttr.market_cap_usd ?? 0);
-        if (!mcValue && price > 0) {
-          const circ = adjustSupply(tokenAttr.circulating_supply, tokenAttr.decimals ?? 18);
-          if (circ > 0) mcValue = circ * price;
-          else if (tokenAttr.fdv_usd) {
-            mcValue = Number(tokenAttr.fdv_usd);
-            mcLabel = 'FDV';
-          } else {
-            const total = adjustSupply(tokenAttr.total_supply, tokenAttr.decimals ?? 18);
-            if (total > 0) {
-              mcValue = total * price;
-              mcLabel = 'FDV';
-            }
-          }
-        }
-
-        if (mcValue && mcValue > 0) extraData += `📊 ${mcLabel}: $${formatUSD(mcValue)}\n`;
-        if (poolAttr.reserve_in_usd) extraData += `💧 Liquidity: $${formatUSD(Number(poolAttr.reserve_in_usd))}\n`;
-        if (poolAttr.volume_usd_24h) extraData += `📈 24h Vol: $${formatUSD(Number(poolAttr.volume_usd_24h))}\n`;
-        if (tokenAttr.price_percent_change_24h != null) {
-          const pct = Number(tokenAttr.price_percent_change_24h);
-          if (Number.isFinite(pct)) extraData += `📊 24h Change: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%\n`;
-        }
-        if (tokenAttr.unique_wallet_count) {
-          extraData += `👥 Holders: ${tokenAttr.unique_wallet_count}\n`;
-        }
-      }
-    } catch (e) {
-      console.warn(`[DEBUG] Extra data fetch failed:`, e.message);
-    }
-
     const isSell = trade.tradeType === 'sell';
     const emoji = isSell ? '🔴' : tierEmoji(cfg, usd);
     const action = isSell ? 'SELL' : 'BUY';
@@ -1203,26 +1302,24 @@ async function broadcastTrade(pool, trade) {
       `${emoji} <b>${action}</b> • <b>${escapeHtml(symbol)}</b>\n` +
       `💵 <b>$${usd.toFixed(2)}</b>\n` +
       `🧮 ${amountTok} ${escapeHtml(symbol)} @ ${priceStr}\n` +
-      extraData +
+      sharedExtraData +
       (trade.buyer ? `👤 ${escapeHtml(trade.buyer.slice(0,6))}…${escapeHtml(trade.buyer.slice(-4))}\n` : '') +
       `🔗 <a href="${txUrl}">TX</a>`;
 
-    const replyMarkup = { 
-      inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]] 
+    const replyMarkup = {
+      inline_keyboard: [[{ text: '📈 Chart', url: chart }, { text: '🔎 TX', url: txUrl }]]
     };
 
-    // Use safe video sender with fallback
-    await safeSend(chatId, async (sendOpts) => {
+    await safeSend(chatId, async () => {
       const usedVideo = await safeSendVideo(
-        chatId, 
-        cfg, 
-        caption, 
-        replyMarkup, 
+        chatId,
+        cfg,
+        caption,
+        replyMarkup,
         cfg.threadId
       );
-      
+
       if (!usedVideo) {
-        // Fallback to text message
         await bot.sendMessage(chatId, caption, {
           parse_mode: 'HTML',
           disable_web_page_preview: true,
@@ -1238,12 +1335,23 @@ async function tickOnce() {
   if (!poolRoundRobin.length) return;
   const pool = poolRoundRobin.shift();
   poolRoundRobin.push(pool);
+
   const trades = await fetchTradesForPool(pool);
   if (!trades.length) return;
+
   const latest = trades[0];
   if (latest?.id && await seen(pool, latest.id)) return;
   if (latest?.id) await broadcastTrade(pool, latest);
 }
 
-setInterval(() => queue.add(tickOnce).catch(console.error), Number(POLL_INTERVAL_MS));
+/**
+ * Keep your fast loop if you want, but queue hard-caps real GT calls to ~1/sec.
+ * This preserves “feels instant” while preventing 429s.
+ */
+setInterval(() => {
+  queue.add(tickOnce).catch((e) => {
+    console.error('[TICK] failed:', e?.response?.status, e?.response?.data || e.message);
+  });
+}, Number(POLL_INTERVAL_MS));
+
 console.log('Buy bot started on network:', GECKO_NETWORK);
